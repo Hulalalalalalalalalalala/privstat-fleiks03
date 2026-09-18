@@ -9,7 +9,8 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import uvicorn
 
@@ -24,7 +25,7 @@ def running_demo(port: int):
             listener.listen(128)
             server = uvicorn.Server(
                 uvicorn.Config(
-                    create_app(Path(directory) / "demo.sqlite3"), log_level="info"
+                    create_app(Path(directory) / "demo.sqlite3"), log_level="warning"
                 )
             )
             worker = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
@@ -43,6 +44,15 @@ def running_demo(port: int):
                     raise RuntimeError("PrivStat service did not shut down.")
 
 
+def _get_json(base_url: str, endpoint: str):
+    with urlopen(base_url + endpoint, timeout=10) as response:
+        return response.status, json.loads(response.read().decode("utf-8"))
+
+
+def _print_json(prefix: str, payload) -> None:
+    print(prefix, json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Show the PrivStat catalog through HTTP.")
     parser.add_argument("--port", type=int, default=8000)
@@ -58,7 +68,41 @@ def main() -> None:
                     print(title.group(1) if title else content, flush=True)
                 else:
                     print(json.dumps(json.loads(content), ensure_ascii=False, indent=2), flush=True)
-    print("PrivStat demo service closed.", flush=True)
+
+        publish_payload = {
+            "request_id": "demo-release-0001",
+            "dataset_id": "retail-demo",
+            "filters": [
+                {"field": "region", "value": "north"},
+                {"field": "membership", "value": "standard"},
+            ],
+            "epsilon": 1.0,
+        }
+        request = Request(
+            base_url + "/api/releases",
+            data=json.dumps(publish_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        print("\nPOST /api/releases ->", flush=True)
+        _print_json("  request:", publish_payload)
+        try:
+            with urlopen(request, timeout=10) as response:
+                release = json.loads(response.read().decode("utf-8"))
+            print(f"  HTTP {200}", flush=True)
+            _print_json("  response:", release)
+        except HTTPError as error:
+            print(f"  HTTP {error.code}: {error.read().decode('utf-8')}", flush=True)
+            raise
+
+        print("\nGET /api/privacy-budget ->", flush=True)
+        status, budget = _get_json(base_url, "/api/privacy-budget")
+        _print_json(f"  HTTP {status}:", budget)
+
+        print("\nGET /api/releases ->", flush=True)
+        status, releases = _get_json(base_url, "/api/releases")
+        _print_json(f"  HTTP {status}:", releases)
+    print("\nPrivStat demo service closed.", flush=True)
 
 
 if __name__ == "__main__":
