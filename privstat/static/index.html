@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PrivStat · 数据目录</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #19342f; background: #f4f7f5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header { padding: 24px max(6vw, 24px); border-bottom: 1px solid #dce6e0; background: white; }
+    .brand { font-weight: 750; font-size: 24px; letter-spacing: -.8px; }
+    .brand span { color: #6a8077; margin-left: 16px; font-weight: 400; font-size: 14px; letter-spacing: 0; }
+    main { max-width: 1000px; margin: 64px auto; padding: 0 24px; }
+    .eyebrow { color: #547565; font-size: 12px; letter-spacing: 2px; }
+    h1 { font-size: clamp(28px, 5vw, 40px); margin: 12px 0; }
+    .intro { color: #64776e; line-height: 1.8; }
+    #status { margin: 32px 0 16px; color: #536d61; font-size: 14px; }
+    article { border: 1px solid #dce6e0; border-radius: 12px; padding: 28px; background: white; margin-bottom: 20px; }
+    h2 { font-size: 20px; margin: 0 0 12px; }
+    article p { color: #64776e; line-height: 1.7; }
+    .badge { display: inline-block; color: #236345; background: #edf7f0; padding: 5px 10px; border-radius: 6px; font-size: 12px; }
+    .fields { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .fields code { background: #f4f7f5; border: 1px solid #e4eae6; border-radius: 5px; padding: 6px 10px; font-size: 13px; }
+    footer { margin-top: 32px; color: #76847b; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <header><div class="brand">PrivStat <span>本地数据目录</span></div></header>
+  <main>
+    <div class="eyebrow">DATA CATALOG</div>
+    <h1>认识数据，从目录开始。</h1>
+    <p class="intro">查看本地数据集的名称、说明与字段。此页面仅显示目录信息。</p>
+    <div id="status" role="status" aria-live="polite">正在读取数据目录…</div>
+    <section id="datasets" aria-label="数据集列表"></section>
+    <footer>当前使用合成零售样例，不包含真实客户数据。</footer>
+  </main>
+  <script>
+    async function loadCatalog() {
+      const status = document.getElementById('status');
+      const list = document.getElementById('datasets');
+      try {
+        const response = await fetch('/api/datasets');
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const datasets = await response.json();
+        status.textContent = `可用数据集 · ${datasets.length}`;
+        for (const dataset of datasets) {
+          const card = document.createElement('article');
+          const title = document.createElement('h2');
+          title.textContent = dataset.name;
+          const description = document.createElement('p');
+          description.textContent = dataset.description;
+          const badge = document.createElement('span');
+          badge.className = 'badge';
+          badge.textContent = dataset.synthetic ? '合成数据' : '本地数据';
+          const fields = document.createElement('div');
+          fields.className = 'fields';
+          for (const name of dataset.fields) {
+            const field = document.createElement('code');
+            field.textContent = name;
+            fields.append(field);
+          }
+          card.append(title, description, badge, fields);
+          list.append(card);
+        }
+      } catch (error) {
+        status.textContent = `数据目录暂时不可用：${error.message}`;
+      }
+    }
+    loadCatalog();
+  </script>
+</body>
+</html>
