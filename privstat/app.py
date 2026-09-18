@@ -1,15 +1,30 @@
 """Public HTTP entry points for the local catalog."""
 
+import math
 import os
+import random
 import sqlite3
 from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
-from .database import ROOT, initialize_database, list_datasets
+from .database import (
+    DATASET_ID,
+    DEFAULT_EPSILON_BUDGET,
+    PUBLIC_FILTER_FIELDS,
+    ROOT,
+    BudgetExceededError,
+    ReleaseConflictError,
+    budget_status,
+    count_matching_members,
+    create_release,
+    initialize_database,
+    list_datasets,
+    list_releases,
+)
 
 
 class DatasetMetadata(BaseModel):
@@ -20,10 +35,76 @@ class DatasetMetadata(BaseModel):
     fields: list[str]
 
 
+class ReleaseRequest(BaseModel):
+    request_id: str
+    dataset_id: str
+    filters: dict[str, str] | None = None
+    epsilon: float = Field(ge=0.1, le=1.0)
+
+    @field_validator("request_id", "dataset_id")
+    @classmethod
+    def require_non_blank(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("必须是非空字符串")
+        return value.strip()
+
+    @field_validator("filters")
+    @classmethod
+    def only_public_fields(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        if value is None:
+            return None
+        unsupported = sorted(set(value) - set(PUBLIC_FILTER_FIELDS))
+        if unsupported:
+            raise ValueError(f"不支持的筛选字段: {', '.join(unsupported)}")
+        return value
+
+
+class ReleaseRecord(BaseModel):
+    release_id: str
+    request_id: str
+    dataset_id: str
+    filters: dict[str, str]
+    epsilon: float
+    published_count: int
+    remaining_budget: float
+    created_at: str
+
+
+class PrivacyBudget(BaseModel):
+    initial_budget: float
+    used_budget: float
+    remaining_budget: float
+
+
+def _laplace_noise(scale: float) -> float:
+    # Inverse-CDF Laplace sample; random() is in [0, 1) so the log is finite.
+    sample = random.SystemRandom().random() - 0.5
+    if sample == 0.0:
+        return 0.0
+    return -scale * math.copysign(math.log1p(-2.0 * abs(sample)), sample)
+
+
+def _noisy_count(true_count: int, epsilon: float) -> int:
+    noisy = true_count + _laplace_noise(1.0 / epsilon)
+    return max(0, math.floor(noisy + 0.5))
+
+
+def _configured_budget() -> float:
+    raw = os.environ.get("PRIVSTAT_EPSILON_BUDGET")
+    if raw is None:
+        return DEFAULT_EPSILON_BUDGET
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_EPSILON_BUDGET
+    return value if value > 0 else DEFAULT_EPSILON_BUDGET
+
+
 def create_app(database_path: Path | None = None) -> FastAPI:
     path = database_path or Path(
         os.environ.get("PRIVSTAT_DATABASE_PATH", ROOT / ".runtime" / "privstat.sqlite3")
     )
+    epsilon_budget = _configured_budget()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -46,6 +127,42 @@ def create_app(database_path: Path | None = None) -> FastAPI:
     @application.get("/api/datasets", response_model=list[DatasetMetadata])
     def datasets() -> list[dict]:
         return list_datasets(path)
+
+    @application.post("/api/releases", response_model=ReleaseRecord, status_code=201)
+    def publish_release(request: ReleaseRequest, response: Response) -> dict:
+        if request.dataset_id != DATASET_ID:
+            raise HTTPException(status_code=404, detail=f"未知数据集：{request.dataset_id}")
+        filters = request.filters or {}
+        published_count = _noisy_count(count_matching_members(path, filters), request.epsilon)
+        try:
+            record, created = create_release(
+                path,
+                request_id=request.request_id,
+                dataset_id=request.dataset_id,
+                filters=filters,
+                epsilon=request.epsilon,
+                published_count=published_count,
+                budget=epsilon_budget,
+            )
+        except ReleaseConflictError:
+            raise HTTPException(
+                status_code=409, detail="request_id 已用于不同的请求，请更换标识"
+            ) from None
+        except BudgetExceededError:
+            raise HTTPException(
+                status_code=409, detail="隐私预算不足，本次发布未记录"
+            ) from None
+        if not created:
+            response.status_code = 200
+        return record
+
+    @application.get("/api/privacy-budget", response_model=PrivacyBudget)
+    def privacy_budget() -> dict:
+        return budget_status(path, epsilon_budget)
+
+    @application.get("/api/releases", response_model=list[ReleaseRecord])
+    def releases() -> list[dict]:
+        return list_releases(path)
 
     return application
 

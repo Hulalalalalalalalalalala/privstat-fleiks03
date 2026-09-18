@@ -9,7 +9,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import uvicorn
 
@@ -58,6 +58,27 @@ def main() -> None:
                     print(title.group(1) if title else content, flush=True)
                 else:
                     print(json.dumps(json.loads(content), ensure_ascii=False, indent=2), flush=True)
+        release_payload = {
+            "request_id": "demo-release-001",
+            "dataset_id": "retail-demo",
+            "filters": {"region": "north"},
+            "epsilon": 0.5,
+        }
+        request = Request(
+            base_url + "/api/releases",
+            data=json.dumps(release_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=10) as response:
+            content = response.read().decode("utf-8")
+            print(f"\nPOST /api/releases -> HTTP {response.status}", flush=True)
+            print(json.dumps(json.loads(content), ensure_ascii=False, indent=2), flush=True)
+        for endpoint in ("/api/privacy-budget", "/api/releases"):
+            with urlopen(base_url + endpoint, timeout=10) as response:
+                content = response.read().decode("utf-8")
+                print(f"\nGET {endpoint} -> HTTP {response.status}", flush=True)
+                print(json.dumps(json.loads(content), ensure_ascii=False, indent=2), flush=True)
     print("PrivStat demo service closed.", flush=True)
 
 
