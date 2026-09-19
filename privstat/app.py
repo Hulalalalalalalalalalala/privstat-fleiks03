@@ -30,8 +30,10 @@ from .database import (
     BatchConflictError,
     BudgetExceededError,
     ReleaseConflictError,
+    ShareQuotaExhaustedError,
     budget_status,
     canonical_filters,
+    claim_served_access,
     count_matching_members,
     create_release,
     create_release_batch,
@@ -188,6 +190,20 @@ class ShareRequest(BaseModel):
     to_time: datetime | None = Field(default=None, alias="to")
     limit: int = Field(default=50, ge=1, le=100)
     expires_at: datetime
+    # Successful-visit quota: omitted or null means unlimited; a supplied
+    # value must be an integer in 1-1000.
+    max_accesses: int | None = Field(default=None, ge=1, le=1000)
+
+    @field_validator("max_accesses", mode="before")
+    @classmethod
+    def max_accesses_is_int_or_null(cls, value: object) -> object:
+        if value is None:
+            return None
+        # bool is an int subclass; JSON booleans and numeric strings/floats
+        # are rejected rather than silently coerced.
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("max_accesses 必须是 1–1000 的整数或 null")
+        return value
 
     @field_validator("dataset_id")
     @classmethod
@@ -483,6 +499,13 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             "limit": record["limit"],
             "created_at": record["created_at"],
             "expires_at": record["expires_at"],
+            "max_accesses": record["max_accesses"],
+            "served_count": record["served_count"],
+            "remaining_accesses": (
+                None
+                if record["max_accesses"] is None
+                else max(0, record["max_accesses"] - record["served_count"])
+            ),
         }
 
     @application.post("/api/shares", status_code=201)
@@ -507,6 +530,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             end=request.to_time,
             limit=request.limit,
             expires_at=request.expires_at,
+            max_accesses=request.max_accesses,
         )
         return _share_payload(record)
 
@@ -555,7 +579,8 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="未知分享")
         now = datetime.now(timezone.utc)
         # Revocation takes precedence over expiry, which takes precedence
-        # over a superseded token generation.
+        # over a superseded token generation, which precedes the quota
+        # check: none of these rejections spends quota.
         if share["revoked_at"] is not None:
             outcome = "revoked"
         elif datetime.fromisoformat(share["expires_at"]) <= now:
@@ -591,15 +616,26 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             end=datetime.fromisoformat(share["to"]) if share["to"] else None,
             limit=share["limit"],
         )
-        # Audit first, return second: a failed audit write raises and the
-        # resolved share data never leaves the server.
-        record_share_access_event(
-            path,
-            share_id=share["share_id"],
-            token_version=share["token_version"],
-            outcome="served",
-            result_count=len(records),
-        )
+        # Counter increment and the served/exhausted audit commit in one
+        # SQLite transaction. Rows are returned only on a committed success:
+        # exhaustion commits the quota_exhausted event and answers 429 with
+        # no data; any other failure rolls both writes back (no quota
+        # spent) and answers 500.
+        try:
+            claim_served_access(
+                path,
+                share_id=share["share_id"],
+                token_version=share["token_version"],
+                result_count=len(records),
+            )
+        except ShareQuotaExhaustedError:
+            raise HTTPException(
+                status_code=429, detail="分享访问配额已用尽"
+            ) from None
+        except Exception:
+            raise HTTPException(
+                status_code=500, detail="访问配额或审计写入失败"
+            ) from None
         return records
 
     @application.get(
@@ -617,7 +653,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         if outcome is not None and outcome not in SHARE_ACCESS_OUTCOMES:
             raise HTTPException(
                 status_code=422,
-                detail="outcome 只能是 served、expired、revoked 或 superseded",
+                detail="outcome 只能是 served、expired、revoked、superseded 或 quota_exhausted",
             )
         if share_id is not None:
             share_id = share_id.strip()

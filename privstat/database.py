@@ -43,6 +43,19 @@ class BatchConflictError(Exception):
         self.detail = detail
 
 
+class ShareQuotaExhaustedError(Exception):
+    """A visit reached a finite share after all successes were consumed.
+
+    Raised only after the ``quota_exhausted`` audit event committed in the
+    same transaction that found the quota spent; ``event`` is the stored
+    event record. The quota counter itself is not incremented.
+    """
+
+    def __init__(self, event: dict):
+        super().__init__("share quota exhausted")
+        self.event = event
+
+
 def _utc_iso(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
@@ -58,12 +71,16 @@ _SHARES_COLUMNS_SQL = (
     "dataset_id TEXT NOT NULL, request_id TEXT, "
     "from_time TEXT, to_time TEXT, result_limit INTEGER NOT NULL, "
     "created_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
-    "revoked_at TEXT)"
+    "revoked_at TEXT, "
+    # NULL max_accesses means an unlimited share; served_count counts only
+    # successful (HTTP 200) visits and never resets on rotation.
+    "max_accesses INTEGER, served_count INTEGER NOT NULL DEFAULT 0)"
 )
 
 _SHARES_INSERT_COLUMNS = (
     "share_id, token_digest, dataset_id, request_id, from_time, to_time, "
-    "result_limit, created_at, expires_at, revoked_at"
+    "result_limit, created_at, expires_at, revoked_at, max_accesses, "
+    "served_count"
 )
 
 # One row per token generation: generation 1 is the original token from
@@ -81,8 +98,9 @@ _SHARE_TOKENS_COLUMNS_SQL = (
 # One row per partner visit to GET /api/shares/{token}/releases. Only the
 # resolved share_id and token generation are kept: neither the raw token nor
 # its digest is ever stored, so the audit trail cannot be turned back into
-# credentials. outcome is served/expired/revoked/superseded; result_count is
-# the number of release records in a served response and 0 for a rejection.
+# credentials. outcome is served/expired/revoked/superseded/quota_exhausted;
+# result_count is the number of release records in a served response and 0
+# for a rejection.
 _SHARE_ACCESS_EVENTS_COLUMNS_SQL = (
     "CREATE TABLE IF NOT EXISTS share_access_events ("
     "event_id TEXT PRIMARY KEY, share_id TEXT NOT NULL, "
@@ -110,7 +128,7 @@ def _migrate_legacy_shares(connection: sqlite3.Connection) -> None:
     connection.execute(_SHARES_COLUMNS_SQL)
     connection.executemany(
         f"INSERT INTO shares ({_SHARES_INSERT_COLUMNS}) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)",
         [
             (
                 share_id,
@@ -219,9 +237,21 @@ def initialize_database(path: Path) -> None:
             share_columns = _table_columns(connection, "shares")
             if not share_columns:
                 connection.execute(_SHARES_COLUMNS_SQL)
+                share_columns = _table_columns(connection, "shares")
             elif "token_digest" not in share_columns:
                 _migrate_legacy_shares(connection)
                 migrated_plaintext = True
+                share_columns = _table_columns(connection, "shares")
+            # Access quotas were added after digested shares: existing rows
+            # migrate to unlimited (max_accesses NULL) with zero successful
+            # visits, keeping scope, token generations and status intact.
+            if "max_accesses" not in share_columns:
+                connection.execute("ALTER TABLE shares ADD COLUMN max_accesses INTEGER")
+            if "served_count" not in share_columns:
+                connection.execute(
+                    "ALTER TABLE shares ADD COLUMN served_count INTEGER NOT NULL "
+                    "DEFAULT 0"
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_shares_created_at "
                 "ON shares (created_at DESC)"
@@ -646,6 +676,8 @@ def _share_from_row(row: sqlite3.Row) -> dict:
         "created_at": row["created_at"],
         "expires_at": row["expires_at"],
         "revoked_at": row["revoked_at"],
+        "max_accesses": row["max_accesses"],
+        "served_count": row["served_count"],
     }
 
 
@@ -658,11 +690,13 @@ def create_share(
     end: datetime | None,
     limit: int,
     expires_at: datetime,
+    max_accesses: int | None = None,
 ) -> dict:
     """Persist a share scope and return the stored record.
 
     The raw token is an unguessable random string returned to the caller
-    exactly once; only its SHA-256 digest is stored. No token or digest
+    exactly once; only its SHA-256 digest is stored. ``max_accesses`` is the
+    successful-visit quota; None means unlimited. No token or digest
     ever appears in release history or exports.
     """
     token = secrets.token_urlsafe(32)
@@ -677,11 +711,13 @@ def create_share(
         "created_at": _utc_iso(datetime.now(timezone.utc)),
         "expires_at": _utc_iso(expires_at),
         "revoked_at": None,
+        "max_accesses": max_accesses,
+        "served_count": 0,
     }
     with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute(
             f"INSERT INTO shares ({_SHARES_INSERT_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 record["share_id"],
                 hash_token(token),
@@ -693,6 +729,8 @@ def create_share(
                 record["created_at"],
                 record["expires_at"],
                 record["revoked_at"],
+                record["max_accesses"],
+                record["served_count"],
             ),
         )
         # The original token is generation 1 of the share.
@@ -945,6 +983,13 @@ def list_shares(
                 "created_at": share["created_at"],
                 "expires_at": share["expires_at"],
                 "revoked_at": share["revoked_at"],
+                "max_accesses": share["max_accesses"],
+                "served_count": share["served_count"],
+                "remaining_accesses": (
+                    None
+                    if share["max_accesses"] is None
+                    else max(0, share["max_accesses"] - share["served_count"])
+                ),
                 "status": _share_status(
                     share["expires_at"], share["revoked_at"], now_iso
                 ),
@@ -953,7 +998,13 @@ def list_shares(
     return records
 
 
-SHARE_ACCESS_OUTCOMES = ("served", "expired", "revoked", "superseded")
+SHARE_ACCESS_OUTCOMES = (
+    "served",
+    "expired",
+    "revoked",
+    "superseded",
+    "quota_exhausted",
+)
 
 
 def _access_event_from_row(row: sqlite3.Row) -> dict:
@@ -1016,6 +1067,95 @@ def record_share_access_event(
                 connection.execute("ROLLBACK")
             raise
     return record
+
+
+def claim_served_access(
+    path: Path,
+    *,
+    share_id: str,
+    token_version: int,
+    result_count: int,
+) -> dict:
+    """Atomically consume one successful visit and append its served event.
+
+    A single BEGIN IMMEDIATE transaction reads ``max_accesses`` and
+    ``served_count``, then either:
+
+    - the share still has quota (or is unlimited): increments
+      ``served_count`` and inserts the ``served`` audit event, committing
+      both together and returning the stored event plus the new counter; or
+    - a finite quota is already spent: inserts the ``quota_exhausted``
+      audit event (result_count 0) without touching the counter, commits
+      it, and raises :class:`ShareQuotaExhaustedError` carrying the event.
+
+    Because the check and the increment share one serialized transaction,
+    concurrent visits can commit at most ``max_accesses`` successes. Any
+    failure before COMMIT rolls the counter and the audit row back, so the
+    caller can answer 500 without spending quota.
+    """
+    accessed_at = _utc_iso(datetime.now(timezone.utc))
+    with closing(sqlite3.connect(path)) as connection:
+        connection.isolation_level = None
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT max_accesses, served_count FROM shares "
+                "WHERE share_id = ?",
+                (share_id,),
+            ).fetchone()
+            if row is None:  # pragma: no cover - share resolved moments earlier
+                raise RuntimeError(f"分享在访问期间消失：{share_id}")
+            max_accesses, served_count = row
+            event = {
+                "event_id": uuid.uuid4().hex,
+                "share_id": share_id,
+                "token_version": token_version,
+                "accessed_at": accessed_at,
+            }
+            if max_accesses is not None and served_count >= max_accesses:
+                event["outcome"] = "quota_exhausted"
+                event["result_count"] = 0
+                connection.execute(
+                    "INSERT INTO share_access_events "
+                    "(event_id, share_id, token_version, outcome, result_count, "
+                    "accessed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        event["event_id"],
+                        event["share_id"],
+                        event["token_version"],
+                        event["outcome"],
+                        event["result_count"],
+                        event["accessed_at"],
+                    ),
+                )
+                connection.execute("COMMIT")
+                raise ShareQuotaExhaustedError(event)
+            event["outcome"] = "served"
+            event["result_count"] = result_count
+            connection.execute(
+                "UPDATE shares SET served_count = served_count + 1 "
+                "WHERE share_id = ?",
+                (share_id,),
+            )
+            connection.execute(
+                "INSERT INTO share_access_events "
+                "(event_id, share_id, token_version, outcome, result_count, "
+                "accessed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    event["event_id"],
+                    event["share_id"],
+                    event["token_version"],
+                    event["outcome"],
+                    event["result_count"],
+                    event["accessed_at"],
+                ),
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+    return {"event": event, "served_count": served_count + 1}
 
 
 def list_share_access_events(

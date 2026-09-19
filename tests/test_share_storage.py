@@ -34,6 +34,9 @@ MANAGED_FIELDS = {
     "expires_at",
     "revoked_at",
     "status",
+    "max_accesses",
+    "served_count",
+    "remaining_accesses",
 }
 
 

@@ -384,8 +384,13 @@ class ShareAccessEventEndpointTests(unittest.TestCase):
     def test_failed_audit_write_blocks_share_data(self):
         with running_demo(0) as base_url:
             publish(base_url, "audit-write-fails")
-            share = create_share_http(base_url, request_id="audit-write-fails")
+            share = create_share_http(
+                base_url, request_id="audit-write-fails", max_accesses=3
+            )
             with mock.patch(
+                "privstat.app.claim_served_access",
+                side_effect=RuntimeError("quota storage unavailable"),
+            ), mock.patch(
                 "privstat.app.record_share_access_event",
                 side_effect=RuntimeError("audit storage unavailable"),
             ):
@@ -393,9 +398,19 @@ class ShareAccessEventEndpointTests(unittest.TestCase):
                     base_url, "GET", f"/api/shares/{share['token']}/releases"
                 )
                 self.assertEqual(status, 500)
-                # Served data must not accompany the failed audit.
+                # Served data must not accompany the failed write.
                 self.assertNotIn("audit-write-fails", body)
                 self.assertNotIn(share["token"], body)
+                # The rolled-back claim spent no quota: the counter is
+                # unchanged and the full quota is still listed.
+                status, listing = request(base_url, "GET", "/api/shares?limit=100")
+                self.assertEqual(status, 200)
+                listed = [
+                    s for s in json.loads(listing)
+                    if s["share_id"] == share["share_id"]
+                ][0]
+                self.assertEqual(listed["served_count"], 0)
+                self.assertEqual(listed["remaining_accesses"], 3)
 
                 status, _ = request(
                     base_url, "DELETE", f"/api/shares/id/{share['share_id']}"
@@ -407,11 +422,18 @@ class ShareAccessEventEndpointTests(unittest.TestCase):
                 self.assertEqual(status, 500)
                 self.assertNotIn("分享已撤销", body)
             # Once storage works again, access behaves normally and the
-            # failed served attempt left no half-written event.
+            # failed served attempt left no half-written event; the share
+            # is revoked, and the quota was never consumed.
             status, body = request(
                 base_url, "GET", f"/api/shares/{share['token']}/releases"
             )
             self.assertEqual(status, 410)
+            status, listing = request(base_url, "GET", "/api/shares?limit=100")
+            listed = [
+                s for s in json.loads(listing)
+                if s["share_id"] == share["share_id"]
+            ][0]
+            self.assertEqual(listed["served_count"], 0)
             status, events, _ = list_events(
                 base_url, f"share_id={share['share_id']}"
             )
