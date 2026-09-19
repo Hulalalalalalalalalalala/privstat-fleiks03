@@ -204,6 +204,47 @@ def list_releases(path: Path) -> list[dict]:
     return [_release_from_row(row) for row in rows]
 
 
+def query_releases(
+    path: Path,
+    *,
+    dataset_id: str | None = None,
+    request_id: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Read-only filtered view of successfully published releases.
+
+    Only the releases table is read; member-level data is never touched.
+    The window is [start, end) compared against created_at in UTC, and
+    results are newest first, capped at ``limit`` rows.
+    """
+    clauses: list[str] = []
+    parameters: list[object] = []
+    if dataset_id is not None:
+        clauses.append("dataset_id = ?")
+        parameters.append(dataset_id)
+    if request_id is not None:
+        clauses.append("request_id = ?")
+        parameters.append(request_id)
+    if start is not None:
+        clauses.append("created_at >= ?")
+        parameters.append(start.astimezone(timezone.utc).isoformat(timespec="milliseconds"))
+    if end is not None:
+        clauses.append("created_at < ?")
+        parameters.append(end.astimezone(timezone.utc).isoformat(timespec="milliseconds"))
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    query = (
+        "SELECT * FROM releases"
+        + where
+        + " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+    )
+    with closing(sqlite3.connect(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(query, (*parameters, limit)).fetchall()
+    return [_release_from_row(row) for row in rows]
+
+
 def budget_status(path: Path, budget: float) -> dict:
     with closing(sqlite3.connect(path)) as connection:
         used = connection.execute(

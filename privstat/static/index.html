@@ -29,14 +29,15 @@
     .stat-value { font-size: 26px; font-weight: 700; }
     .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin: 18px 0; }
     label { display: block; color: #40544b; font-size: 13px; }
-    input { width: 100%; margin-top: 6px; padding: 9px 10px; border: 1px solid #cfdbd4; border-radius: 8px; font: inherit; font-size: 14px; background: white; }
-    input:focus { outline: 2px solid #9fc3b2; outline-offset: 1px; }
+    input, select { width: 100%; margin-top: 6px; padding: 9px 10px; border: 1px solid #cfdbd4; border-radius: 8px; font: inherit; font-size: 14px; background: white; }
+    input:focus, select:focus { outline: 2px solid #9fc3b2; outline-offset: 1px; }
     button { margin-top: 4px; padding: 10px 22px; border: 0; border-radius: 8px; background: #236345; color: white; font: inherit; font-weight: 600; cursor: pointer; }
     button:hover { background: #1b5037; }
     button:disabled { background: #9db3a8; cursor: wait; }
     #release-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
-    #release-message.error { color: #9b2c2c; }
-    #release-message.success { color: #236345; }
+    #release-message.error, #export-message.error { color: #9b2c2c; }
+    #release-message.success, #export-message.success { color: #236345; }
+    #export-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
     .release-card { padding: 18px 20px; }
     .release-card h3 { margin: 0 0 8px; font-size: 16px; }
     .release-card dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 6px 18px; margin: 0; font-size: 13px; }
@@ -86,6 +87,34 @@
       <div class="eyebrow">HISTORY</div>
       <h2>发布历史</h2>
       <div id="releases"></div>
+    </section>
+
+    <section class="panel" aria-label="历史导出">
+      <div class="eyebrow">EXPORT</div>
+      <h2>导出发布历史</h2>
+      <p class="intro">面向合作方导出已成功发布的记录，仅含公开字段；导出为只读操作，不消耗隐私预算。</p>
+      <form id="export-form">
+        <div class="form-grid">
+          <label>格式 format
+            <select id="export-format">
+              <option value="json">JSON</option>
+              <option value="csv">CSV</option>
+            </select>
+          </label>
+          <label>数据集 dataset_id
+            <select id="export-dataset">
+              <option value="">全部（仅 retail-demo）</option>
+              <option value="retail-demo">retail-demo</option>
+            </select>
+          </label>
+          <label>请求标识 request_id（可选，精确匹配）<input id="export-request-id" placeholder="如 req-shared"></label>
+          <label>起始时间 from（包含）<input id="export-from" type="datetime-local" step="1"></label>
+          <label>结束时间 to（不包含）<input id="export-to" type="datetime-local" step="1"></label>
+          <label>条数 limit（1–100）<input id="export-limit" type="number" min="1" max="100" value="50"></label>
+        </div>
+        <button type="submit" id="export-button">导出文件</button>
+      </form>
+      <div id="export-message" role="status" aria-live="polite"></div>
     </section>
 
     <footer>当前使用合成零售样例，不包含真实客户数据。</footer>
@@ -250,6 +279,82 @@
     loadCatalog();
     refreshBudget();
     refreshHistory();
+
+    function localInputToIso(value) {
+      if (!value) return '';
+      return new Date(value).toISOString();
+    }
+
+    document.getElementById('export-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const message = document.getElementById('export-message');
+      const button = document.getElementById('export-button');
+      const params = new URLSearchParams();
+      params.set('format', document.getElementById('export-format').value);
+      const datasetId = document.getElementById('export-dataset').value;
+      if (datasetId) params.set('dataset_id', datasetId);
+      const requestId = document.getElementById('export-request-id').value.trim();
+      if (requestId) params.set('request_id', requestId);
+      const fromIso = localInputToIso(document.getElementById('export-from').value);
+      const toIso = localInputToIso(document.getElementById('export-to').value);
+      if (fromIso) params.set('from', fromIso);
+      if (toIso) params.set('to', toIso);
+      const limitRaw = document.getElementById('export-limit').value;
+      const limit = Number.parseInt(limitRaw, 10);
+      if (limitRaw === '' || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+        message.className = 'error';
+        message.textContent = '导出失败：limit 必须是 1–100 的整数。';
+        return;
+      }
+      params.set('limit', String(limit));
+      if (fromIso && toIso && new Date(fromIso) >= new Date(toIso)) {
+        message.className = 'error';
+        message.textContent = '导出失败：起始时间必须早于结束时间。';
+        return;
+      }
+      message.className = '';
+      message.textContent = '';
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/releases/export?${params.toString()}`);
+        if (!response.ok) {
+          const data = await response.json().catch(() => null);
+          message.className = 'error';
+          message.textContent = `导出失败：${formatError(data, response.status)}`;
+          return;
+        }
+        const format = params.get('format');
+        const text = await response.text();
+        let empty = false;
+        if (format === 'json') {
+          let parsed;
+          try { parsed = JSON.parse(text); } catch (_) { parsed = null; }
+          empty = Array.isArray(parsed) && parsed.length === 0;
+        } else {
+          empty = text.trim().split(/\r?\n/).length <= 1;
+        }
+        const blob = new Blob([text], {
+          type: format === 'json' ? 'application/json' : 'text/csv;charset=utf-8',
+        });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `releases-export.${format}`;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        message.className = empty ? '' : 'success';
+        message.textContent = empty
+          ? '没有匹配的发布记录，已下载空结果文件。'
+          : '导出文件已开始下载。';
+      } catch (error) {
+        message.className = 'error';
+        message.textContent = `导出失败：${error.message}`;
+      } finally {
+        button.disabled = false;
+      }
+    });
   </script>
 </body>
 </html>
