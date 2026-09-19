@@ -13,19 +13,21 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .database import (
     DATASET_ID,
     DEFAULT_EPSILON_BUDGET,
     PUBLIC_FILTER_FIELDS,
     ROOT,
+    BatchConflictError,
     BudgetExceededError,
     ReleaseConflictError,
     budget_status,
     canonical_filters,
     count_matching_members,
     create_release,
+    create_release_batch,
     create_share,
     get_share_by_token,
     initialize_database,
@@ -71,7 +73,37 @@ class ReleaseRequest(BaseModel):
         return value
 
 
+class BatchReleaseItem(ReleaseRequest):
+    """One sub-request of a batch: identical fields and validation as the
+    single release endpoint, with no undeclared fields allowed."""
+
+    model_config = {"extra": "forbid"}
+
+
+class BatchReleaseRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    batch_id: str
+    requests: list[BatchReleaseItem] = Field(min_length=1, max_length=20)
+
+    @field_validator("batch_id")
+    @classmethod
+    def batch_id_non_blank(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("batch_id 必须是非空字符串")
+        return value.strip()
+
+    @model_validator(mode="after")
+    def request_ids_unique_within_batch(self) -> "BatchReleaseRequest":
+        request_ids = [item.request_id for item in self.requests]
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("批内 request_id 必须唯一")
+        return self
+
+
 class RotateRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
     rotation_id: str
 
     @field_validator("rotation_id")
@@ -89,6 +121,14 @@ class ReleaseRecord(BaseModel):
     filters: dict[str, str]
     epsilon: float
     published_count: int
+    remaining_budget: float
+    created_at: str
+
+
+class BatchReleaseResponse(BaseModel):
+    batch_id: str
+    releases: list[ReleaseRecord]
+    total_epsilon: float
     remaining_budget: float
     created_at: str
 
@@ -247,6 +287,54 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         except BudgetExceededError:
             raise HTTPException(
                 status_code=409, detail="隐私预算不足，本次发布未记录"
+            ) from None
+        if not created:
+            response.status_code = 200
+        return record
+
+    @application.post(
+        "/api/releases/batch", response_model=BatchReleaseResponse, status_code=201
+    )
+    def publish_release_batch(request: BatchReleaseRequest, response: Response) -> dict:
+        # A single unknown dataset fails the whole batch with 404 before any
+        # sampling, deduction or write; shape/type/range/duplicate errors are
+        # rejected one layer earlier with 422.
+        if any(item.dataset_id != DATASET_ID for item in request.requests):
+            raise HTTPException(status_code=404, detail="批次中存在未知数据集")
+
+        def sample_count(true_count: int, epsilon: float) -> int:
+            return _noisy_count(true_count, epsilon)
+
+        items = [
+            {
+                "request_id": item.request_id,
+                "dataset_id": item.dataset_id,
+                "filters": item.filters or {},
+                "epsilon": item.epsilon,
+            }
+            for item in request.requests
+        ]
+        try:
+            record, created = create_release_batch(
+                path,
+                batch_id=request.batch_id,
+                items=items,
+                budget=epsilon_budget,
+                sample_count=sample_count,
+            )
+        except ReleaseConflictError:
+            raise HTTPException(
+                status_code=409,
+                detail="批次中存在已被单条或批量发布占用的 request_id，整批未记录",
+            ) from None
+        except BatchConflictError:
+            raise HTTPException(
+                status_code=409,
+                detail="batch_id 已用于不同的请求，请更换标识",
+            ) from None
+        except BudgetExceededError:
+            raise HTTPException(
+                status_code=409, detail="隐私预算不足以覆盖整批 epsilon，本次批量发布未记录"
             ) from None
         if not created:
             response.status_code = 200

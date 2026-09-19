@@ -116,6 +116,8 @@ class RotateEndpointTests(unittest.TestCase):
                 {"rotation_id": "   "},
                 {"rotation_id": 123},
                 {"rotation_id": None},
+                {"rotation_id": "rot-extra", "unexpected": 1},
+                {"rotation_id": "rot-extra", "x": {"nested": True}},
             ):
                 with self.subTest(payload=payload):
                     status, _ = request(

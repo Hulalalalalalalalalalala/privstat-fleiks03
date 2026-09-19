@@ -9,6 +9,7 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +27,10 @@ class ReleaseConflictError(Exception):
 
 class BudgetExceededError(Exception):
     """The remaining privacy budget cannot cover the requested epsilon."""
+
+
+class BatchConflictError(Exception):
+    """The batch_id was already spent on a different normalized batch."""
 
 
 def _utc_iso(moment: datetime) -> str:
@@ -152,17 +157,35 @@ def initialize_database(path: Path) -> None:
                 "membership TEXT NOT NULL, age_band TEXT NOT NULL, "
                 "visit_bucket TEXT NOT NULL)"
             )
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS releases ("
-                "release_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, "
-                "dataset_id TEXT NOT NULL, filters_json TEXT NOT NULL, "
-                "epsilon REAL NOT NULL, published_count INTEGER NOT NULL, "
-                "remaining_budget REAL NOT NULL, created_at TEXT NOT NULL)"
-            )
+            release_columns = _table_columns(connection, "releases")
+            if not release_columns:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS releases ("
+                    "release_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, "
+                    "dataset_id TEXT NOT NULL, filters_json TEXT NOT NULL, "
+                    "epsilon REAL NOT NULL, published_count INTEGER NOT NULL, "
+                    "remaining_budget REAL NOT NULL, created_at TEXT NOT NULL, "
+                    "batch_id TEXT)"
+                )
+            elif "batch_id" not in release_columns:
+                # Batch releases live in the same table as single releases so
+                # request_id occupancy and the privacy budget stay shared;
+                # NULL batch_id marks records created via POST /api/releases.
+                connection.execute("ALTER TABLE releases ADD COLUMN batch_id TEXT")
             _backfill_release_timestamps(connection)
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_releases_created_at "
                 "ON releases (created_at DESC)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS release_batches ("
+                "batch_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, "
+                "total_epsilon REAL NOT NULL, remaining_budget REAL NOT NULL, "
+                "created_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_releases_batch "
+                "ON releases (batch_id)"
             )
             share_columns = _table_columns(connection, "shares")
             if not share_columns:
@@ -338,6 +361,185 @@ def create_release(
             )
             connection.execute("COMMIT")
             return record, True
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+
+def _serialize_batch_request(items: list[dict]) -> str:
+    """Canonical JSON of a batch's sub-requests for idempotency comparison.
+
+    Each item keeps the same normalized shape as a single release: trimmed
+    ids, canonical filters and epsilon. sort_keys recursively orders filter
+    keys, so two requests differing only in JSON key order compare equal.
+    Item order is significant because the response mirrors input order, so
+    the list itself is never sorted.
+    """
+    return json.dumps(
+        [
+            {
+                "request_id": item["request_id"],
+                "dataset_id": item["dataset_id"],
+                "filters": item["filters"],
+                "epsilon": item["epsilon"],
+            }
+            for item in items
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _count_matching(connection: sqlite3.Connection, filters: dict) -> int:
+    clauses = " AND ".join(f"{field} = ?" for field in filters)
+    query = "SELECT COUNT(*) FROM retail_members"
+    if clauses:
+        query += f" WHERE {clauses}"
+    return connection.execute(query, tuple(filters.values())).fetchone()[0]
+
+
+def _batch_from_storage(
+    connection: sqlite3.Connection, batch_id: str
+) -> tuple[dict, list[dict]] | None:
+    """Rebuild a stored batch response from the committed rows."""
+    header = connection.execute(
+        "SELECT * FROM release_batches WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+    if header is None:
+        return None
+    # rowid preserves insertion order inside the single batch transaction.
+    rows = connection.execute(
+        "SELECT * FROM releases WHERE batch_id = ? ORDER BY rowid", (batch_id,)
+    ).fetchall()
+    return dict(header), [_release_from_row(row) for row in rows]
+
+
+def create_release_batch(
+    path: Path,
+    *,
+    batch_id: str,
+    items: list[dict],
+    budget: float,
+    sample_count: Callable[[int, float], int],
+) -> tuple[dict, bool]:
+    """Atomically publish 1-20 releases under one idempotency key.
+
+    ``items`` is a list of dicts carrying request_id, dataset_id, a
+    normalized filters dict and epsilon, already validated by the caller;
+    in-batch request_ids are unique. ``sample_count(true_count, epsilon)``
+    applies the same noise as a single release to a true count read on
+    this transaction's connection; it is invoked exactly once per item,
+    inside the transaction and only when the batch is genuinely created —
+    never on replay or a failed batch — so retries never re-sample.
+    Returns (response, created).
+
+    A replayed batch_id with an identical normalized request returns the
+    original response (same releases, totals and timestamp) with
+    created=False and neither samples, deducts nor writes. A batch_id
+    reused with a different normalized request raises BatchConflictError.
+    Any request_id already occupied by a single or batch release raises
+    ReleaseConflictError; insufficient total budget raises
+    BudgetExceededError. On any failure the transaction rolls back, so no
+    release row and no batch placeholder survive. BEGIN IMMEDIATE
+    serializes concurrent batches against single releases.
+    """
+    request_json = _serialize_batch_request(items)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.isolation_level = None
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            header = connection.execute(
+                "SELECT request_json FROM release_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if header is not None:
+                if header["request_json"] != request_json:
+                    raise BatchConflictError(batch_id)
+                stored = _batch_from_storage(connection, batch_id)
+                connection.execute("COMMIT")
+                assert stored is not None
+                stored_header, releases = stored
+                response = {
+                    "batch_id": batch_id,
+                    "releases": releases,
+                    "total_epsilon": stored_header["total_epsilon"],
+                    "remaining_budget": stored_header["remaining_budget"],
+                    "created_at": stored_header["created_at"],
+                }
+                return response, False
+            # First confirm in one transaction that every request_id is free
+            # against both single (batch_id IS NULL) and batch releases.
+            request_ids = [item["request_id"] for item in items]
+            placeholders = ",".join("?" for _ in request_ids)
+            occupied = connection.execute(
+                f"SELECT request_id FROM releases WHERE request_id IN ({placeholders})",
+                request_ids,
+            ).fetchall()
+            if occupied:
+                raise ReleaseConflictError(occupied[0]["request_id"])
+            used = connection.execute(
+                "SELECT COALESCE(SUM(epsilon), 0.0) FROM releases"
+            ).fetchone()[0]
+            total_epsilon = round(sum(item["epsilon"] for item in items), _BUDGET_PRECISION)
+            final_remaining = round(budget - used - total_epsilon, _BUDGET_PRECISION)
+            if final_remaining < 0:
+                raise BudgetExceededError(batch_id)
+            created_at = _utc_iso(datetime.now(timezone.utc))
+            remaining = budget - used
+            records = []
+            for item in items:
+                filters = item["filters"]
+                filters_json = canonical_filters(filters)
+                true_count = _count_matching(connection, filters)
+                published_count = sample_count(true_count, item["epsilon"])
+                remaining = round(remaining - item["epsilon"], _BUDGET_PRECISION)
+                record = {
+                    "release_id": uuid.uuid4().hex,
+                    "request_id": item["request_id"],
+                    "dataset_id": item["dataset_id"],
+                    "filters": json.loads(filters_json),
+                    "epsilon": item["epsilon"],
+                    "published_count": published_count,
+                    "remaining_budget": remaining,
+                    "created_at": created_at,
+                }
+                connection.execute(
+                    "INSERT INTO releases (release_id, request_id, dataset_id, "
+                    "filters_json, epsilon, published_count, remaining_budget, "
+                    "created_at, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        record["release_id"],
+                        record["request_id"],
+                        record["dataset_id"],
+                        filters_json,
+                        record["epsilon"],
+                        record["published_count"],
+                        record["remaining_budget"],
+                        record["created_at"],
+                        batch_id,
+                    ),
+                )
+                records.append(record)
+            connection.execute(
+                "INSERT INTO release_batches (batch_id, request_json, "
+                "total_epsilon, remaining_budget, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (batch_id, request_json, total_epsilon, final_remaining, created_at),
+            )
+            connection.execute("COMMIT")
+            return (
+                {
+                    "batch_id": batch_id,
+                    "releases": records,
+                    "total_epsilon": total_epsilon,
+                    "remaining_budget": final_remaining,
+                    "created_at": created_at,
+                },
+                True,
+            )
         except BaseException:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
