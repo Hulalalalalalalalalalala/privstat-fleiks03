@@ -22,9 +22,13 @@ python3 -m venv .venv
 
 `GET /api/releases/export` 面向合作方导出已成功发布的历史，只读、不扣减预算也不产生审计记录。查询参数：`format` 为 `json`（默认）或 `csv`；`dataset_id` 可省略，提供时只能为 `retail-demo`；`request_id` 可省略，精确匹配，显式空值 `request_id=` 返回 200 空结果（纯空白仍返回 422）；`from`/`to` 为可选 ISO-8601 时间，`from` 包含、`to` 不包含，按 `created_at` 的实际时刻精确比较，不截断到毫秒；`limit` 默认 50，范围 1–100。结果按 `created_at` 倒序并截取前 `limit` 条。`format`、`dataset_id`、时间或 `limit` 非法，或 `from` 不早于 `to`，返回 422；`request_id` 无匹配返回 200 空结果。JSON 返回对象数组；CSV 返回 UTF-8 文本，首行固定为 `release_id,request_id,dataset_id,filters,epsilon,published_count,remaining_budget,created_at`，其中 `filters` 为规范化 JSON 字符串。导出仅读取 releases 表的公开字段，不读取 `retail_members`，也不返回 `member_id`、真实计数或任何行级数据。首页提供导出表单并展示可读错误提示。
 
-`POST /api/shares` 创建可撤销、可过期的合作方分享：请求体含 `dataset_id`（仅支持 `retail-demo`）、可选 `request_id`、`from`、`to`、`limit`（默认 50，范围 1–100）与必填 `expires_at`；时间须为带时区的 ISO-8601，窗口前含后不含，`expires_at` 须在未来，非法输入或 `from` 不早于 `to` 返回 422。范围持久化到 SQLite，返回 201 及不可猜测的 `share_id`、`token`、规范化范围与创建/过期时间；token 不会出现在发布历史或导出中。`GET /api/shares/{token}/releases` 仅返回范围内已成功发布的记录，字段与发布记录一致，按 `created_at` 倒序并受 `limit` 限制；未知 token 返回 404，过期或已撤销返回 410；访问为只读，不读取 `retail_members`，不扣减预算也不新增发布记录。`DELETE /api/shares/{token}` 原子撤销并幂等返回 204（未知 token 返回 404），撤销状态持久化，撤销提交后的访问不再成功。首页提供创建分享、复制链接、撤销与可读状态展示。
+`POST /api/shares` 创建可撤销、可过期的合作方分享：请求体含 `dataset_id`（仅支持 `retail-demo`）、可选 `request_id`、`from`、`to`、`limit`（默认 50，范围 1–100）与必填 `expires_at`；时间须为带时区的 ISO-8601，窗口前含后不含，`expires_at` 须在未来，非法输入或 `from` 不早于 `to` 返回 422。范围持久化到 SQLite，返回 201 及不可猜测的 `share_id`、`token`、规范化范围与创建/过期时间；**原始 token 仅出现在这一次 201 响应中**，数据库只保存其 SHA-256 摘要，token 不会出现在发布历史或导出中。`GET /api/shares/{token}/releases` 仅返回范围内已成功发布的记录，字段与发布记录一致，按 `created_at` 倒序并受 `limit` 限制；未知 token 返回 404，过期或已撤销返回 410；访问为只读，不读取 `retail_members`，不扣减预算也不新增发布记录。
 
-启动时将 `data/retail_members.csv` 导入 SQLite，默认数据库为 `.runtime/privstat.sqlite3`；可用 `PRIVSTAT_DATABASE_PATH` 指定其他路径。重复启动保留已有记录。
+`GET /api/shares` 供管理端列出分享：可按 `status=active|expired|revoked`、`dataset_id`、`request_id` 精确筛选，`limit` 默认 50、范围 1–100；非法状态、未知或空白 `dataset_id`、纯空白 `request_id`、非法 `limit` 返回 422（显式空值 `request_id=` 与无匹配一样返回 200 空结果）。结果按 `created_at` 倒序，返回除 token 外的创建字段（`share_id`、`dataset_id`、`request_id`、`from`、`to`、`limit`、`created_at`、`expires_at`）以及 `revoked_at`、`status`；`status` 按当前 UTC 即时计算，撤销优先于过期；响应绝不包含 token 或其摘要。
+
+`DELETE /api/shares/id/{share_id}` 对已存在的分享原子、幂等撤销并返回 204（保留首次撤销时间），未知 `share_id` 返回 404，撤销提交后通过原链接访问返回 410。`DELETE /api/shares/{token}` 同样原子幂等返回 204；按 token 撤销未知 token 也返回 204（撤销是状态断言，调用后该链接必不可用）。并发撤销只落一个持久状态。首页提供分享列表、状态筛选与按 `share_id` 撤销；所有管理操作均为只读，不读取 `retail_members`、不扣减预算、不新增发布记录。
+
+启动时将 `data/retail_members.csv` 导入 SQLite，默认数据库为 `.runtime/privstat.sqlite3`；可用 `PRIVSTAT_DATABASE_PATH` 指定其他路径。重复启动保留已有记录。启动迁移幂等：旧库明文 token 会重建为仅存 SHA-256 摘要（并 VACUUM 清除残留页内容），旧链接仍可凭原 token 访问与撤销；迁移在单个事务内完成，失败时回滚、不丢失任何分享，下次启动重试。既有发布记录回填可索引的 UTC 微秒时间列，导出与分享范围在数据库内以前含后不含的微秒精度筛选，保持倒序与限量语义。
 
 ```sh
 .venv/bin/python -m privstat.demo --port 8000

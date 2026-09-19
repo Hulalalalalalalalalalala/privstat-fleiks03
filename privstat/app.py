@@ -20,6 +20,7 @@ from .database import (
     DEFAULT_EPSILON_BUDGET,
     PUBLIC_FILTER_FIELDS,
     ROOT,
+    SHARE_STATUSES,
     BudgetExceededError,
     ReleaseConflictError,
     budget_status,
@@ -31,8 +32,10 @@ from .database import (
     initialize_database,
     list_datasets,
     list_releases,
+    list_shares,
     query_releases,
-    revoke_share,
+    revoke_share_by_id,
+    revoke_share_by_token,
 )
 
 
@@ -83,6 +86,21 @@ class PrivacyBudget(BaseModel):
     initial_budget: float
     used_budget: float
     remaining_budget: float
+
+
+class ShareSummary(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    share_id: str
+    dataset_id: str
+    request_id: str | None = None
+    from_time: str | None = Field(default=None, alias="from")
+    to_time: str | None = Field(default=None, alias="to")
+    limit: int
+    created_at: str
+    expires_at: str
+    revoked_at: str | None = None
+    status: str
 
 
 def _parse_share_time(raw: object, name: str) -> datetime:
@@ -347,6 +365,39 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         )
         return _share_payload(record)
 
+    @application.get("/api/shares", response_model=list[ShareSummary])
+    def list_partner_shares(
+        status: str | None = Query(default=None),
+        dataset_id: str | None = Query(default=None),
+        request_id: str | None = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> list[dict]:
+        if status is not None and status not in SHARE_STATUSES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"status 只能是 {', '.join(SHARE_STATUSES)}",
+            )
+        if dataset_id is not None:
+            if not dataset_id.strip():
+                raise HTTPException(status_code=422, detail="dataset_id 必须是非空字符串")
+            if dataset_id != DATASET_ID:
+                raise HTTPException(status_code=422, detail=f"未知数据集：{dataset_id}")
+        if request_id is not None:
+            if request_id == "":
+                # An explicitly empty request_id= is a valid filter that
+                # matches nothing; whitespace-only values are rejected.
+                return []
+            request_id = request_id.strip()
+            if not request_id:
+                raise HTTPException(status_code=422, detail="request_id 必须是非空字符串")
+        return list_shares(
+            path,
+            status=status,
+            dataset_id=dataset_id,
+            request_id=request_id,
+            limit=limit,
+        )
+
     @application.get(
         "/api/shares/{token}/releases", response_model=list[ReleaseRecord]
     )
@@ -370,10 +421,17 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             limit=share["limit"],
         )
 
+    @application.delete("/api/shares/id/{share_id}", status_code=204)
+    def revoke_partner_share_by_id(share_id: str) -> Response:
+        if not revoke_share_by_id(path, share_id):
+            raise HTTPException(status_code=404, detail="未知分享")
+        return Response(status_code=204)
+
     @application.delete("/api/shares/{token}", status_code=204)
     def revoke_partner_share(token: str) -> Response:
-        if not revoke_share(path, token):
-            raise HTTPException(status_code=404, detail="未知分享")
+        # Idempotent even for an unknown token: the caller's desired end state
+        # (no usable link) holds either way, so no share exists afterwards.
+        revoke_share_by_token(path, token)
         return Response(status_code=204)
 
     return application

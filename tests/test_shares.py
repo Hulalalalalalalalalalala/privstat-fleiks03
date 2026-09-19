@@ -211,14 +211,16 @@ class ShareAccessTests(unittest.TestCase):
             self.assertEqual(budget_before, budget_after)
             self.assertEqual(history_before, history_after)
 
-    def test_unknown_token_returns_404(self):
+    def test_unknown_token_returns_404_on_access_and_204_on_revoke(self):
         with running_demo(0) as base_url:
             status, _ = request(
                 base_url, "GET", "/api/shares/no-such-token/releases"
             )
             self.assertEqual(status, 404)
-            status, _ = request(base_url, "DELETE", "/api/shares/no-such-token")
-            self.assertEqual(status, 404)
+            # Revocation asserts an end state, so an unknown token is 204 too.
+            status, body = request(base_url, "DELETE", "/api/shares/no-such-token")
+            self.assertEqual(status, 204)
+            self.assertEqual(body, "")
 
     def test_expired_share_returns_410(self):
         with running_demo(0) as base_url:
