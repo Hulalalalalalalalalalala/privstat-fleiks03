@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import secrets
 import sqlite3
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
@@ -26,10 +27,13 @@ from .database import (
     canonical_filters,
     count_matching_members,
     create_release,
+    create_share,
+    get_share_by_token,
     initialize_database,
     list_datasets,
     list_releases,
     query_releases,
+    revoke_share,
 )
 
 
@@ -80,6 +84,50 @@ class PrivacyBudget(BaseModel):
     initial_budget: float
     used_budget: float
     remaining_budget: float
+
+
+class ShareCreateRequest(BaseModel):
+    dataset_id: str
+    request_id: str | None = None
+    from_time: datetime | None = Field(default=None, alias="from")
+    to_time: datetime | None = Field(default=None, alias="to")
+    limit: int = Field(default=50, ge=1, le=100)
+    expires_at: datetime
+
+    @field_validator("dataset_id")
+    @classmethod
+    def require_non_blank(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("必须是非空字符串")
+        return value.strip()
+
+    @field_validator("request_id")
+    @classmethod
+    def blank_request_id_rejected(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError("request_id 必须是非空字符串")
+        return value.strip()
+
+    @field_validator("from_time", "to_time", "expires_at")
+    @classmethod
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("时间必须携带时区，例如 2026-01-01T00:00:00Z")
+        return value
+
+
+class ShareRecord(BaseModel):
+    share_id: str
+    token: str
+    dataset_id: str
+    request_id: str | None
+    from_time: datetime | None = Field(serialization_alias="from")
+    to_time: datetime | None = Field(serialization_alias="to")
+    limit: int
+    expires_at: datetime
+    created_at: datetime
 
 
 EXPORT_FIELDS = [
@@ -194,6 +242,73 @@ def create_app(database_path: Path | None = None) -> FastAPI:
     def releases() -> list[dict]:
         return list_releases(path)
 
+    @application.post("/api/shares", response_model=ShareRecord, status_code=201)
+    def create_partner_share(request: ShareCreateRequest) -> ShareRecord:
+        if request.dataset_id != DATASET_ID:
+            raise HTTPException(
+                status_code=422, detail=f"dataset_id 只能为 {DATASET_ID}"
+            )
+        start = request.from_time.astimezone(timezone.utc) if request.from_time else None
+        end = request.to_time.astimezone(timezone.utc) if request.to_time else None
+        expires_at = request.expires_at.astimezone(timezone.utc)
+        if start is not None and end is not None and start >= end:
+            raise HTTPException(status_code=422, detail="from 必须早于 to")
+        now = datetime.now(timezone.utc)
+        if expires_at <= now:
+            raise HTTPException(status_code=422, detail="expires_at 必须是未来时间")
+        # The token is shown once and only its SHA-256 hash is persisted.
+        token = secrets.token_urlsafe(32)
+        record = create_share(
+            path,
+            token=token,
+            dataset_id=request.dataset_id,
+            request_id=request.request_id,
+            start=start,
+            end=end,
+            limit=request.limit,
+            expires_at=expires_at,
+        )
+        return ShareRecord(
+            share_id=record["share_id"],
+            token=token,
+            dataset_id=record["dataset_id"],
+            request_id=record["request_id"],
+            from_time=datetime.fromisoformat(record["from"]) if record["from"] else None,
+            to_time=datetime.fromisoformat(record["to"]) if record["to"] else None,
+            limit=record["limit"],
+            expires_at=datetime.fromisoformat(record["expires_at"]),
+            created_at=datetime.fromisoformat(record["created_at"]),
+        )
+
+    @application.get(
+        "/api/shares/{token}/releases", response_model=list[ReleaseRecord]
+    )
+    def share_releases(token: str) -> list[dict]:
+        share = get_share_by_token(path, token)
+        if share is None:
+            raise HTTPException(status_code=404, detail="分享不存在")
+        if share["revoked_at"] is not None:
+            raise HTTPException(status_code=410, detail="分享已撤销")
+        if datetime.now(timezone.utc) >= datetime.fromisoformat(share["expires_at"]):
+            raise HTTPException(status_code=410, detail="分享已过期")
+        # Read-only: only the releases table is queried, no budget is spent and
+        # no record is written; member-level data is never accessed.
+        return query_releases(
+            path,
+            dataset_id=share["dataset_id"],
+            request_id=share["request_id"],
+            start=datetime.fromisoformat(share["from"]) if share["from"] else None,
+            end=datetime.fromisoformat(share["to"]) if share["to"] else None,
+            limit=share["limit"],
+        )
+
+    @application.delete("/api/shares/{token}", status_code=204)
+    def delete_share(token: str) -> Response:
+        # Idempotent: revoking a missing or already-revoked share still yields
+        # the same committed state and a 204.
+        revoke_share(path, token)
+        return Response(status_code=204)
+
     @application.get("/api/releases/export")
     def export_releases(
         format: str = Query(default="json"),
@@ -208,9 +323,14 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         if dataset_id is not None and dataset_id != DATASET_ID:
             raise HTTPException(status_code=422, detail=f"dataset_id 只能为 {DATASET_ID}")
         if request_id is not None:
-            request_id = request_id.strip()
-            if not request_id:
+            if request_id == "":
+                # An explicit empty request_id is a valid filter that matches
+                # nothing (stored request_ids are non-blank): 200 empty result.
+                pass
+            elif not request_id.strip():
                 raise HTTPException(status_code=422, detail="request_id 必须是非空字符串")
+            else:
+                request_id = request_id.strip()
         start = _parse_export_time(from_time, "from") if from_time is not None else None
         end = _parse_export_time(to_time, "to") if to_time is not None else None
         if start is not None and end is not None and start >= end:

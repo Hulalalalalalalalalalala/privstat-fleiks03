@@ -1,6 +1,7 @@
 """SQLite storage for the bundled synthetic data catalog."""
 
 import csv
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -16,6 +17,9 @@ DATASET_ID = "retail-demo"
 DEFAULT_EPSILON_BUDGET = 3.0
 # Rounding precision for budget arithmetic, absorbs float representation dust.
 _BUDGET_PRECISION = 9
+# Timestamps are stored at microsecond resolution so sub-millisecond windows
+# and boundaries compare against the actual release instant, not a truncation.
+_STORAGE_TIMESPEC = "microseconds"
 
 
 class ReleaseConflictError(Exception):
@@ -24,6 +28,11 @@ class ReleaseConflictError(Exception):
 
 class BudgetExceededError(Exception):
     """The remaining privacy budget cannot cover the requested epsilon."""
+
+
+def hash_token(token: str) -> str:
+    """One-way digest for a share token; raw tokens are never stored."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def initialize_database(path: Path) -> None:
@@ -46,6 +55,14 @@ def initialize_database(path: Path) -> None:
             "dataset_id TEXT NOT NULL, filters_json TEXT NOT NULL, "
             "epsilon REAL NOT NULL, published_count INTEGER NOT NULL, "
             "remaining_budget REAL NOT NULL, created_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS shares ("
+            "share_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, "
+            "dataset_id TEXT NOT NULL, request_id TEXT, "
+            "window_start TEXT, window_end TEXT, limit_value INTEGER NOT NULL, "
+            "expires_at TEXT NOT NULL, created_at TEXT NOT NULL, "
+            "revoked_at TEXT)"
         )
         if connection.execute(
             "SELECT 1 FROM datasets WHERE id = ?", (DATASET_ID,)
@@ -169,7 +186,7 @@ def create_release(
                 "published_count": published_count,
                 "remaining_budget": remaining,
                 "created_at": datetime.now(timezone.utc).isoformat(
-                    timespec="milliseconds"
+                    timespec=_STORAGE_TIMESPEC
                 ),
             }
             connection.execute(
@@ -216,8 +233,8 @@ def query_releases(
     """Read-only filtered view of successfully published releases.
 
     Only the releases table is read; member-level data is never touched.
-    The window is [start, end) compared against created_at in UTC, and
-    results are newest first, capped at ``limit`` rows.
+    The window is [start, end) compared at the actual stored instants in
+    UTC (no truncation), and results are newest first, capped at ``limit``.
     """
     clauses: list[str] = []
     parameters: list[object] = []
@@ -229,10 +246,10 @@ def query_releases(
         parameters.append(request_id)
     if start is not None:
         clauses.append("created_at >= ?")
-        parameters.append(start.astimezone(timezone.utc).isoformat(timespec="milliseconds"))
+        parameters.append(start.astimezone(timezone.utc).isoformat(timespec=_STORAGE_TIMESPEC))
     if end is not None:
         clauses.append("created_at < ?")
-        parameters.append(end.astimezone(timezone.utc).isoformat(timespec="milliseconds"))
+        parameters.append(end.astimezone(timezone.utc).isoformat(timespec=_STORAGE_TIMESPEC))
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     query = (
         "SELECT * FROM releases"
@@ -256,3 +273,93 @@ def budget_status(path: Path, budget: float) -> dict:
         "used_budget": used,
         "remaining_budget": max(0.0, round(budget - used, _BUDGET_PRECISION)),
     }
+
+
+def _iso_utc(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat(timespec=_STORAGE_TIMESPEC)
+
+
+def create_share(
+    path: Path,
+    *,
+    token: str,
+    dataset_id: str,
+    request_id: str | None,
+    start: datetime | None,
+    end: datetime | None,
+    limit: int,
+    expires_at: datetime,
+) -> dict:
+    """Persist a partner share. Only the token hash is stored, never the token."""
+    now = datetime.now(timezone.utc)
+    record = {
+        "share_id": uuid.uuid4().hex,
+        "dataset_id": dataset_id,
+        "request_id": request_id,
+        "from": _iso_utc(start),
+        "to": _iso_utc(end),
+        "limit": limit,
+        "expires_at": _iso_utc(expires_at),
+        "created_at": _iso_utc(now),
+        "revoked_at": None,
+    }
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "INSERT INTO shares (share_id, token_hash, dataset_id, request_id, "
+            "window_start, window_end, limit_value, expires_at, created_at, "
+            "revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (
+                record["share_id"],
+                hash_token(token),
+                record["dataset_id"],
+                record["request_id"],
+                record["from"],
+                record["to"],
+                record["limit"],
+                record["expires_at"],
+                record["created_at"],
+            ),
+        )
+    return record
+
+
+def get_share_by_token(path: Path, token: str) -> dict | None:
+    """Look up a share by its raw token. Never reads member-level data."""
+    with closing(sqlite3.connect(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT share_id, dataset_id, request_id, window_start, window_end, "
+            "limit_value, expires_at, created_at, revoked_at "
+            "FROM shares WHERE token_hash = ?",
+            (hash_token(token),),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "share_id": row["share_id"],
+        "dataset_id": row["dataset_id"],
+        "request_id": row["request_id"],
+        "from": row["window_start"],
+        "to": row["window_end"],
+        "limit": row["limit_value"],
+        "expires_at": row["expires_at"],
+        "created_at": row["created_at"],
+        "revoked_at": row["revoked_at"],
+    }
+
+
+def revoke_share(path: Path, token: str) -> bool:
+    """Atomically mark a share revoked. Returns False for an unknown token.
+
+    Revoking an already-revoked share is a no-op and still returns True, so
+    DELETE stays idempotent for any token that ever existed.
+    """
+    with closing(sqlite3.connect(path)) as connection, connection:
+        cursor = connection.execute(
+            "UPDATE shares SET revoked_at = COALESCE(revoked_at, ?) "
+            "WHERE token_hash = ?",
+            (_iso_utc(datetime.now(timezone.utc)), hash_token(token)),
+        )
+        return cursor.rowcount > 0

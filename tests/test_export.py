@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import unittest
+from datetime import datetime, timedelta
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -148,6 +149,53 @@ class ExportJsonTests(unittest.TestCase):
             self.assertEqual(
                 {r["request_id"] for r in json.loads(body)}, {"exp-time-1"}
             )
+
+    def test_explicit_empty_request_id_returns_successful_empty_result(self):
+        with running_demo(0) as base_url:
+            publish(base_url, "exp-empty-req")
+            # request_id= (present but empty) is a valid filter matching nothing.
+            status, _, body = get_export(base_url, request_id="")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), [])
+            status, _, body = get_export(base_url, format="csv", request_id="")
+            self.assertEqual(status, 200)
+            self.assertEqual(body.strip().splitlines(), [",".join(CSV_HEADER)])
+
+    def test_window_compares_actual_instant_without_millisecond_truncation(self):
+        with running_demo(0) as base_url:
+            # Pick a release whose sub-millisecond fraction sits safely inside
+            # one millisecond (roughly 80% of releases); microsecond storage
+            # yields one almost immediately.
+            stamp = release_id = None
+            for index in range(10):
+                candidate = publish(base_url, f"exp-subms-{index}", epsilon=0.1)
+                fraction = datetime.fromisoformat(candidate["created_at"]).microsecond % 1000
+                if 100 <= fraction <= 898:
+                    stamp = datetime.fromisoformat(candidate["created_at"])
+                    release_id = candidate["release_id"]
+                    break
+            self.assertIsNotNone(stamp, "created_at 缺少亚毫秒精度，时间比较可能被截断")
+            last_micro_of_ms = stamp.replace(
+                microsecond=(stamp.microsecond // 1000) * 1000 + 999
+            )
+
+            def ids(**parameters):
+                status, _, body = get_export(base_url, **parameters)
+                self.assertEqual(status, 200)
+                return {r["release_id"] for r in json.loads(body)}
+
+            # `to` later in the SAME millisecond includes the record by the
+            # actual instant; truncating both sides to ms would make them equal
+            # and wrongly exclude it.
+            self.assertIn(release_id, ids(to=last_micro_of_ms.isoformat()))
+            # `from` one microsecond AFTER the instant excludes it; truncation
+            # would collapse it onto the record's ms and wrongly include it.
+            self.assertNotIn(
+                release_id, ids(**{"from": (stamp + timedelta(microseconds=1)).isoformat()})
+            )
+            # The exact instant obeys [from, to) regardless of resolution.
+            self.assertIn(release_id, ids(**{"from": stamp.isoformat()}))
+            self.assertNotIn(release_id, ids(to=stamp.isoformat()))
 
     def test_export_is_read_only(self):
         with running_demo(0) as base_url:

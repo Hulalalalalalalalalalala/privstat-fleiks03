@@ -35,15 +35,32 @@
     button:hover { background: #1b5037; }
     button:disabled { background: #9db3a8; cursor: wait; }
     #release-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
-    #release-message.error, #export-message.error { color: #9b2c2c; }
-    #release-message.success, #export-message.success { color: #236345; }
-    #export-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
+    #release-message.error, #export-message.error, #share-message.error { color: #9b2c2c; }
+    #release-message.success, #export-message.success, #share-message.success { color: #236345; }
+    #export-message, #share-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
     .release-card { padding: 18px 20px; }
     .release-card h3 { margin: 0 0 8px; font-size: 16px; }
     .release-card dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 6px 18px; margin: 0; font-size: 13px; }
     .release-card dt { color: #76847b; }
     .release-card dd { margin: 0; color: #19342f; word-break: break-all; }
     .empty { color: #76847b; font-size: 14px; }
+    .share-card { padding: 18px 20px; }
+    .share-card h3 { margin: 0 0 4px; font-size: 15px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .share-card dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 6px 18px; margin: 8px 0 0; font-size: 13px; }
+    .share-card dt { color: #76847b; }
+    .share-card dd { margin: 0; color: #19342f; word-break: break-all; }
+    .share-link { display: flex; gap: 8px; margin-top: 12px; }
+    .share-link input { flex: 1; margin-top: 0; font-size: 12px; }
+    .share-actions { display: flex; gap: 8px; margin-top: 12px; }
+    .status { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+    .status.active { color: #236345; background: #edf7f0; }
+    .status.expired { color: #8a6d1d; background: #fbf3df; }
+    .status.revoked { color: #9b2c2c; background: #fbeaea; }
+    button.secondary { background: white; color: #236345; border: 1px solid #9db3a8; }
+    button.secondary:hover { background: #f4f7f5; }
+    button.danger { background: #9b2c2c; }
+    button.danger:hover { background: #7d2424; }
+    button.small { padding: 8px 14px; font-size: 13px; margin-top: 0; }
   </style>
 </head>
 <body>
@@ -87,6 +104,24 @@
       <div class="eyebrow">HISTORY</div>
       <h2>发布历史</h2>
       <div id="releases"></div>
+    </section>
+
+    <section class="panel" aria-label="合作方分享">
+      <div class="eyebrow">PARTNER SHARES</div>
+      <h2>合作方分享</h2>
+      <p class="intro">为合作方创建可撤销、可过期的只读链接。对方只能看到分享范围内已成功发布的记录，不读取会员明细、不暴露真实计数，也不消耗隐私预算。链接与令牌仅此页可见，请妥善复制保存。</p>
+      <form id="share-form">
+        <div class="form-grid">
+          <label>请求标识 request_id（可选，精确匹配）<input id="share-request-id" placeholder="如 req-shared，可留空"></label>
+          <label>起始时间 from（包含，可选）<input id="share-from" type="datetime-local" step="1"></label>
+          <label>结束时间 to（不包含，可选）<input id="share-to" type="datetime-local" step="1"></label>
+          <label>条数 limit（1–100）<input id="share-limit" type="number" min="1" max="100" value="50"></label>
+          <label>过期时间 expires_at（必填）<input id="share-expires" type="datetime-local" step="1" required></label>
+        </div>
+        <button type="submit" id="share-button">创建分享</button>
+      </form>
+      <div id="share-message" role="status" aria-live="polite"></div>
+      <div id="shares" style="margin-top: 20px;"></div>
     </section>
 
     <section class="panel" aria-label="历史导出">
@@ -280,6 +315,230 @@
     refreshBudget();
     refreshHistory();
 
+    const SHARES_STORAGE_KEY = 'privstat.shares.v1';
+
+    function loadSavedShares() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(SHARES_STORAGE_KEY) || '[]');
+        return Array.isArray(saved) ? saved : [];
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function saveSavedShares(shares) {
+      localStorage.setItem(SHARES_STORAGE_KEY, JSON.stringify(shares));
+    }
+
+    function shareStatus(share, now = new Date()) {
+      if (share.revoked) return 'revoked';
+      if (new Date(share.expires_at) <= now) return 'expired';
+      return 'active';
+    }
+
+    const SHARE_STATUS_TEXT = { active: '生效中', expired: '已过期', revoked: '已撤销' };
+
+    function describeShareScope(share) {
+      const parts = [`limit ${share.limit}`];
+      if (share.request_id) parts.unshift(`request_id=${share.request_id}`);
+      if (share.from) parts.push(`from ${new Date(share.from).toLocaleString()}`);
+      if (share.to) parts.push(`to ${new Date(share.to).toLocaleString()}`);
+      return parts.join('，');
+    }
+
+    async function fetchShareStatus(share) {
+      // The link endpoint itself reports liveness: 200 = active, 410 = gone.
+      try {
+        const response = await fetch(`/api/shares/${share.token}/releases`);
+        if (response.ok) return 'active';
+        if (response.status === 410) {
+          return new Date(share.expires_at) <= new Date() ? 'expired' : 'revoked';
+        }
+      } catch (_) { /* fall back to local status */ }
+      return shareStatus(share);
+    }
+
+    async function renderShares() {
+      const container = document.getElementById('shares');
+      const shares = loadSavedShares();
+      container.textContent = '';
+      if (!shares.length) {
+        const empty = document.createElement('p');
+        empty.className = 'empty';
+        empty.textContent = '尚未创建分享。令牌仅在创建时返回一次，请妥善保存。';
+        container.append(empty);
+        return;
+      }
+      for (const share of shares) {
+        const liveStatus = await fetchShareStatus(share);
+        if (liveStatus === 'revoked') share.revoked = true;
+        const status = shareStatus(share);
+        const card = document.createElement('article');
+        card.className = 'share-card';
+
+        const header = document.createElement('h3');
+        const badge = document.createElement('span');
+        badge.className = `status ${status}`;
+        badge.textContent = SHARE_STATUS_TEXT[status];
+        const idLabel = document.createElement('span');
+        idLabel.textContent = `分享 ${share.share_id.slice(0, 8)}`;
+        header.append(badge, idLabel);
+
+        const details = document.createElement('dl');
+        const items = [
+          ['范围', describeShareScope(share)],
+          ['过期时间', new Date(share.expires_at).toLocaleString()],
+          ['创建时间', new Date(share.created_at).toLocaleString()],
+          ['share_id', share.share_id],
+        ];
+        for (const [label, value] of items) {
+          const dt = document.createElement('dt');
+          dt.textContent = label;
+          const dd = document.createElement('dd');
+          dd.textContent = value;
+          details.append(dt, dd);
+        }
+
+        const linkRow = document.createElement('div');
+        linkRow.className = 'share-link';
+        const linkInput = document.createElement('input');
+        linkInput.readOnly = true;
+        linkInput.value = `${location.origin}/api/shares/${share.token}/releases`;
+        const copyButton = document.createElement('button');
+        copyButton.type = 'button';
+        copyButton.className = 'secondary small';
+        copyButton.textContent = '复制链接';
+        copyButton.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(linkInput.value);
+            copyButton.textContent = '已复制';
+          } catch (_) {
+            linkInput.select();
+            document.execCommand('copy');
+            copyButton.textContent = '已复制';
+          }
+          setTimeout(() => { copyButton.textContent = '复制链接'; }, 1500);
+        });
+        linkRow.append(linkInput, copyButton);
+
+        const actions = document.createElement('div');
+        actions.className = 'share-actions';
+        const revokeButton = document.createElement('button');
+        revokeButton.type = 'button';
+        revokeButton.className = 'danger small';
+        revokeButton.textContent = '撤销分享';
+        revokeButton.disabled = status !== 'active';
+        revokeButton.addEventListener('click', async () => {
+          revokeButton.disabled = true;
+          try {
+            const response = await fetch(`/api/shares/${share.token}`, { method: 'DELETE' });
+            if (response.status !== 204) throw new Error(`HTTP ${response.status}`);
+            share.revoked = true;
+            saveSavedShares(loadSavedShares().map(item =>
+              item.share_id === share.share_id ? share : item
+            ));
+            await renderShares();
+          } catch (error) {
+            revokeButton.disabled = false;
+            const message = document.getElementById('share-message');
+            message.className = 'error';
+            message.textContent = `撤销失败：${error.message}`;
+          }
+        });
+        actions.append(revokeButton);
+
+        card.append(header, details, linkRow, actions);
+        container.append(card);
+      }
+    }
+
+    function refreshShares() {
+      const expiresInput = document.getElementById('share-expires');
+      if (!expiresInput.value) {
+        const defaultExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        const tzOffset = defaultExpiry.getTimezoneOffset() * 60000;
+        expiresInput.value = new Date(defaultExpiry - tzOffset).toISOString().slice(0, 19);
+      }
+      renderShares();
+    }
+
+    document.getElementById('share-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const message = document.getElementById('share-message');
+      const button = document.getElementById('share-button');
+      const payload = {
+        dataset_id: 'retail-demo',
+        limit: 50,
+      };
+      const requestId = document.getElementById('share-request-id').value.trim();
+      if (requestId) payload.request_id = requestId;
+      const fromIso = localInputToIso(document.getElementById('share-from').value);
+      const toIso = localInputToIso(document.getElementById('share-to').value);
+      if (fromIso) payload.from = fromIso;
+      if (toIso) payload.to = toIso;
+      const limitRaw = document.getElementById('share-limit').value;
+      const limit = Number.parseInt(limitRaw, 10);
+      if (limitRaw === '' || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+        message.className = 'error';
+        message.textContent = '创建失败：limit 必须是 1–100 的整数。';
+        return;
+      }
+      payload.limit = limit;
+      const expiresIso = localInputToIso(document.getElementById('share-expires').value);
+      if (!expiresIso) {
+        message.className = 'error';
+        message.textContent = '创建失败：请选择过期时间。';
+        return;
+      }
+      payload.expires_at = expiresIso;
+      if (fromIso && toIso && new Date(fromIso) >= new Date(toIso)) {
+        message.className = 'error';
+        message.textContent = '创建失败：起始时间必须早于结束时间。';
+        return;
+      }
+      message.className = '';
+      message.textContent = '';
+      button.disabled = true;
+      try {
+        const response = await fetch('/api/shares', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+          message.className = 'error';
+          message.textContent = `创建失败：${formatError(data, response.status)}`;
+          return;
+        }
+        const shares = loadSavedShares();
+        shares.unshift({
+          share_id: data.share_id,
+          token: data.token,
+          request_id: data.request_id,
+          from: data.from,
+          to: data.to,
+          limit: data.limit,
+          expires_at: data.expires_at,
+          created_at: data.created_at,
+          revoked: false,
+        });
+        saveSavedShares(shares);
+        document.getElementById('share-request-id').value = '';
+        document.getElementById('share-from').value = '';
+        document.getElementById('share-to').value = '';
+        await renderShares();
+        message.className = 'success';
+        message.textContent = '分享已创建，链接已显示在下方，请立即复制保存（令牌仅本次可见）。';
+      } catch (error) {
+        message.className = 'error';
+        message.textContent = `创建失败：${error.message}`;
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+
     function localInputToIso(value) {
       if (!value) return '';
       return new Date(value).toISOString();
@@ -355,6 +614,8 @@
         button.disabled = false;
       }
     });
+
+    refreshShares();
   </script>
 </body>
 </html>
