@@ -5,7 +5,7 @@ import json
 import sqlite3
 import uuid
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -202,6 +202,63 @@ def list_releases(path: Path) -> list[dict]:
             "SELECT * FROM releases ORDER BY created_at DESC, rowid DESC"
         ).fetchall()
     return [_release_from_row(row) for row in rows]
+
+
+def export_releases(
+    path: Path,
+    *,
+    dataset_id: str | None = None,
+    request_id: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Read-only partner view of successfully published releases.
+
+    Only the releases table is read; retail_members is never touched and
+    nothing is written, so the budget and audit trail are unchanged.
+    ``start`` is inclusive and ``end`` exclusive, compared against the UTC
+    ``created_at`` timestamp. Rows are newest-first and cut to the first
+    ``limit`` records after the exact time filter is applied.
+    """
+    clauses: list[str] = []
+    parameters: list[object] = []
+    if dataset_id is not None:
+        clauses.append("dataset_id = ?")
+        parameters.append(dataset_id)
+    if request_id is not None:
+        clauses.append("request_id = ?")
+        parameters.append(request_id)
+    # Timestamps are stored at millisecond precision. Build SQL bounds that
+    # are a superset of the true window (floor for the inclusive start,
+    # ceiling for the exclusive end), then apply the exact comparison in
+    # Python so sub-millisecond bounds never admit or drop a row wrongly.
+    if start is not None:
+        clauses.append("created_at >= ?")
+        parameters.append(start.astimezone(timezone.utc).isoformat(timespec="milliseconds"))
+    if end is not None:
+        clauses.append("created_at < ?")
+        ceiling = end.astimezone(timezone.utc) + timedelta(milliseconds=1)
+        parameters.append(ceiling.isoformat(timespec="milliseconds"))
+    query = "SELECT * FROM releases"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY created_at DESC, rowid DESC"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(query, tuple(parameters)).fetchall()
+    records: list[dict] = []
+    for row in rows:
+        if start is not None or end is not None:
+            created = datetime.fromisoformat(row["created_at"])
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if start is not None and created < start:
+                continue
+            if end is not None and created >= end:
+                continue
+        records.append(_release_from_row(row))
+    return records[:limit]
 
 
 def budget_status(path: Path, budget: float) -> dict:

@@ -31,17 +31,24 @@
     label { display: block; color: #40544b; font-size: 13px; }
     input { width: 100%; margin-top: 6px; padding: 9px 10px; border: 1px solid #cfdbd4; border-radius: 8px; font: inherit; font-size: 14px; background: white; }
     input:focus { outline: 2px solid #9fc3b2; outline-offset: 1px; }
+    select { width: 100%; margin-top: 6px; padding: 9px 10px; border: 1px solid #cfdbd4; border-radius: 8px; font: inherit; font-size: 14px; background: white; }
+    button.secondary { background: #3f6f5c; }
+    button.secondary:hover { background: #335c4c; }
     button { margin-top: 4px; padding: 10px 22px; border: 0; border-radius: 8px; background: #236345; color: white; font: inherit; font-weight: 600; cursor: pointer; }
     button:hover { background: #1b5037; }
     button:disabled { background: #9db3a8; cursor: wait; }
     #release-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
     #release-message.error { color: #9b2c2c; }
     #release-message.success { color: #236345; }
+    #export-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
+    #export-message.error { color: #9b2c2c; }
+    #export-message.success { color: #236345; }
     .release-card { padding: 18px 20px; }
     .release-card h3 { margin: 0 0 8px; font-size: 16px; }
     .release-card dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 6px 18px; margin: 0; font-size: 13px; }
     .release-card dt { color: #76847b; }
     .release-card dd { margin: 0; color: #19342f; word-break: break-all; }
+    #export-preview { margin-top: 14px; max-height: 320px; overflow: auto; background: #f4f7f5; border: 1px solid #e4eae6; border-radius: 8px; padding: 14px; font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
     .empty { color: #76847b; font-size: 14px; }
   </style>
 </head>
@@ -86,6 +93,29 @@
       <div class="eyebrow">HISTORY</div>
       <h2>发布历史</h2>
       <div id="releases"></div>
+    </section>
+
+    <section class="panel" aria-label="历史导出">
+      <div class="eyebrow">EXPORT</div>
+      <h2>向合作方导出历史</h2>
+      <p class="intro">导出仅含已成功发布的公开记录，不含 member_id、真实计数或行级数据；只读访问，不扣减隐私预算。</p>
+      <form id="export-form">
+        <div class="form-grid">
+          <label>导出格式 format
+            <select id="export-format">
+              <option value="json">json</option>
+              <option value="csv">csv</option>
+            </select>
+          </label>
+          <label>请求标识 request_id（可留空）<input id="export-request-id" placeholder="精确匹配，可留空"></label>
+          <label>起始时间 from（含，可留空）<input id="export-from" type="datetime-local" step="0.001"></label>
+          <label>结束时间 to（不含，可留空）<input id="export-to" type="datetime-local" step="0.001"></label>
+          <label>条数上限 limit（1–100）<input id="export-limit" type="number" min="1" max="100" step="1" value="50" required></label>
+        </div>
+        <button type="submit" class="secondary" id="export-button">预览前 10 条 / 下载导出文件</button>
+      </form>
+      <div id="export-message" role="status" aria-live="polite"></div>
+      <pre id="export-preview" hidden></pre>
     </section>
 
     <footer>当前使用合成零售样例，不包含真实客户数据。</footer>
@@ -247,6 +277,72 @@
     });
 
     document.getElementById('request-id').value = newRequestId();
+
+    document.getElementById('export-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const message = document.getElementById('export-message');
+      const preview = document.getElementById('export-preview');
+      const button = document.getElementById('export-button');
+      const format = document.getElementById('export-format').value;
+      const params = new URLSearchParams();
+      params.set('format', format);
+      params.set('dataset_id', 'retail-demo');
+      const requestId = document.getElementById('export-request-id').value.trim();
+      if (requestId) params.set('request_id', requestId);
+      for (const [key, elementId] of [['from', 'export-from'], ['to', 'export-to']]) {
+        const raw = document.getElementById(elementId).value;
+        if (raw) params.set(key, new Date(raw).toISOString());
+      }
+      const limitValue = document.getElementById('export-limit').value;
+      params.set('limit', limitValue === '' ? '50' : String(parseInt(limitValue, 10)));
+      message.className = '';
+      message.textContent = '';
+      preview.hidden = true;
+      preview.textContent = '';
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/releases/export?${params.toString()}`);
+        const bodyText = await response.text();
+        if (!response.ok) {
+          let detail = '';
+          try { detail = formatError(JSON.parse(bodyText), response.status); }
+          catch (_) { detail = `请求失败（HTTP ${response.status}）`; }
+          message.className = 'error';
+          message.textContent = `导出失败：${detail}`;
+          return;
+        }
+        if (format === 'json') {
+          const records = JSON.parse(bodyText);
+          message.className = 'success';
+          message.textContent = records.length
+            ? `已导出 ${records.length} 条发布记录，以下预览前 ${Math.min(10, records.length)} 条。`
+            : '没有匹配的发布记录，导出结果为空。';
+          preview.textContent = JSON.stringify(records.slice(0, 10), null, 2);
+          preview.hidden = !records.length;
+        } else {
+          const lines = bodyText.split('\n').filter(line => line.length > 0);
+          const count = Math.max(0, lines.length - 1);
+          // Prepend a UTF-8 BOM so spreadsheets detect the encoding.
+          const blob = new Blob(['﻿' + bodyText], { type: 'text/csv;charset=utf-8' });          const link = document.createElement('a');
+          link.href = URL.createObjectURL(blob);
+          link.download = 'releases-export.csv';
+          link.click();
+          URL.revokeObjectURL(link.href);
+          message.className = 'success';
+          message.textContent = count
+            ? `已下载 CSV 文件，共 ${count} 条发布记录。`
+            : '没有匹配的发布记录，CSV 仅含表头。';
+          preview.textContent = lines.slice(0, 11).join('\n');
+          preview.hidden = false;
+        }
+      } catch (error) {
+        message.className = 'error';
+        message.textContent = `导出失败：${error.message}`;
+      } finally {
+        button.disabled = false;
+      }
+    });
+
     loadCatalog();
     refreshBudget();
     refreshHistory();

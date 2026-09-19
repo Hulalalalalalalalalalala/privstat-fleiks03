@@ -20,6 +20,8 @@ python3 -m venv .venv
 
 隐私预算总额默认为 3.0，可用 `PRIVSTAT_EPSILON_BUDGET` 调整。每次首发原子扣减 ε，余额不足返回 409 且不留记录；扣减与幂等记录在 SQLite 中持久化，重启与并发下均成立。`GET /api/privacy-budget` 返回初始、已用与剩余额度，`GET /api/releases` 按时间倒序返回发布历史。首页支持筛选发布、预算与历史展示及可读错误提示。
 
+`GET /api/releases/export` 面向合作方导出已成功发布的历史，只读访问，不扣减预算、不创建审计记录，也不读取 `retail_members`。查询参数：`format` 为 `json`（默认，返回对象数组）或 `csv`（UTF-8 文本，首行固定为 `release_id,request_id,dataset_id,filters,epsilon,published_count,remaining_budget,created_at`，`filters` 用规范化 JSON 字符串编码）；`dataset_id` 可选且只能为 `retail-demo`；`request_id` 可选精确匹配（无匹配返回 200 空结果）；`from`/`to` 可选 ISO-8601 时间（无时区按 UTC，`from` 包含、`to` 不包含，按 `created_at` 的 UTC 时刻比较）；`limit` 默认 50，范围 1–100。结果按 `created_at` 倒序并截取前 `limit` 条。每条记录仅含与发布历史相同的公开字段，不含 `member_id`、真实计数或行级数据。`format`、`dataset_id`、时间或 `limit` 非法，或 `from` 不早于 `to` 时返回 422。首页提供导出入口，可预览 JSON 或下载 CSV，并展示可读错误提示。
+
 启动时将 `data/retail_members.csv` 导入 SQLite，默认数据库为 `.runtime/privstat.sqlite3`；可用 `PRIVSTAT_DATABASE_PATH` 指定其他路径。重复启动保留已有记录。
 
 ```sh

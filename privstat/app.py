@@ -1,13 +1,16 @@
 """Public HTTP entry points for the local catalog."""
 
+import csv
+import io
 import math
 import os
 import random
 import sqlite3
 from contextlib import asynccontextmanager, closing
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -19,8 +22,10 @@ from .database import (
     BudgetExceededError,
     ReleaseConflictError,
     budget_status,
+    canonical_filters,
     count_matching_members,
     create_release,
+    export_releases,
     initialize_database,
     list_datasets,
     list_releases,
@@ -100,6 +105,35 @@ def _configured_budget() -> float:
     return value if value > 0 else DEFAULT_EPSILON_BUDGET
 
 
+def _parse_export_time(value: str | None, field_name: str) -> datetime | None:
+    """Parse an ISO-8601 export bound into an aware UTC datetime."""
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field_name} 必须是 ISO-8601 时间（例如 2026-01-01T00:00:00Z）",
+        ) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+# Fixed, public-only CSV header for partner exports.
+EXPORT_CSV_FIELDS = [
+    "release_id",
+    "request_id",
+    "dataset_id",
+    "filters",
+    "epsilon",
+    "published_count",
+    "remaining_budget",
+    "created_at",
+]
+
+
 def create_app(database_path: Path | None = None) -> FastAPI:
     path = database_path or Path(
         os.environ.get("PRIVSTAT_DATABASE_PATH", ROOT / ".runtime" / "privstat.sqlite3")
@@ -163,6 +197,71 @@ def create_app(database_path: Path | None = None) -> FastAPI:
     @application.get("/api/releases", response_model=list[ReleaseRecord])
     def releases() -> list[dict]:
         return list_releases(path)
+
+    @application.get("/api/releases/export")
+    def export_release_history(
+        format: str = Query(default="json"),
+        dataset_id: str | None = Query(default=None),
+        request_id: str | None = Query(default=None),
+        from_: str | None = Query(default=None, alias="from"),
+        to: str | None = Query(default=None),
+        limit_raw: str = Query(default="50", alias="limit"),
+    ):
+        # Manual validation keeps every 422 message readable on the partner page.
+        if format not in ("json", "csv"):
+            raise HTTPException(status_code=422, detail="format 只能是 json 或 csv")
+        if dataset_id is not None and dataset_id.strip() != DATASET_ID:
+            raise HTTPException(
+                status_code=422, detail=f"dataset_id 仅支持 {DATASET_ID}"
+            )
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422, detail="limit 必须是 1 到 100 之间的整数"
+            ) from None
+        if not 1 <= limit <= 100:
+            raise HTTPException(
+                status_code=422, detail="limit 必须在 1 到 100 之间"
+            )
+        start = _parse_export_time(from_, "from")
+        end = _parse_export_time(to, "to")
+        if start is not None and end is not None and start >= end:
+            raise HTTPException(status_code=422, detail="from 必须早于 to")
+        matched_request_id = request_id.strip() if request_id and request_id.strip() else None
+        records = export_releases(
+            path,
+            dataset_id=dataset_id.strip() if dataset_id is not None else None,
+            request_id=matched_request_id,
+            start=start,
+            end=end,
+            limit=limit,
+        )
+        if format == "json":
+            return records
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(EXPORT_CSV_FIELDS)
+        for record in records:
+            writer.writerow(
+                [
+                    record["release_id"],
+                    record["request_id"],
+                    record["dataset_id"],
+                    canonical_filters(record["filters"]),
+                    record["epsilon"],
+                    record["published_count"],
+                    record["remaining_budget"],
+                    record["created_at"],
+                ]
+            )
+        return Response(
+            content=buffer.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="releases-export.csv"'
+            },
+        )
 
     return application
 
