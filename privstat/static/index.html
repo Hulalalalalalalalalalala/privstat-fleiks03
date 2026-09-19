@@ -30,7 +30,8 @@
     .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin: 18px 0; }
     label { display: block; color: #40544b; font-size: 13px; }
     input, select { width: 100%; margin-top: 6px; padding: 9px 10px; border: 1px solid #cfdbd4; border-radius: 8px; font: inherit; font-size: 14px; background: white; }
-    input:focus, select:focus { outline: 2px solid #9fc3b2; outline-offset: 1px; }
+    textarea { width: 100%; margin-top: 6px; padding: 9px 10px; border: 1px solid #cfdbd4; border-radius: 8px; font: inherit; font-size: 13px; background: white; min-height: 150px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    input:focus, select:focus, textarea:focus { outline: 2px solid #9fc3b2; outline-offset: 1px; }
     button { margin-top: 4px; padding: 10px 22px; border: 0; border-radius: 8px; background: #236345; color: white; font: inherit; font-weight: 600; cursor: pointer; }
     button:hover { background: #1b5037; }
     button:disabled { background: #9db3a8; cursor: wait; }
@@ -60,6 +61,14 @@
     .status-expired { color: #8a6d1d; background: #faf3df; }
     .status-revoked { color: #8c3a3a; background: #f9ecec; }
     .empty { color: #76847b; font-size: 14px; }
+    #batch-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
+    #batch-message.error { color: #9b2c2c; }
+    #batch-message.success { color: #236345; }
+    .batch-summary { margin: 14px 0 10px; font-size: 14px; color: #40544b; }
+    .batch-item { border: 1px solid #e4eae6; border-radius: 8px; padding: 10px 14px; margin-top: 8px; background: #f9fbfa; font-size: 13px; }
+    .batch-item .batch-item-head { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: baseline; }
+    .batch-item strong { color: #19342f; }
+    .batch-item .muted { color: #76847b; }
   </style>
 </head>
 <body>
@@ -97,6 +106,26 @@
         <button type="submit" id="publish-button">发布计数</button>
       </form>
       <div id="release-message" role="status" aria-live="polite"></div>
+    </section>
+
+    <section class="panel" aria-label="批量发布">
+      <div class="eyebrow">BATCH RELEASE</div>
+      <h2>原子批量发布</h2>
+      <p class="intro">在一个事务内发布 1–20 条计数：全部成功才扣减预算并写入，冲突或预算不足整批失败、不留部分记录。同一 <code>batch_id</code> 重放相同请求返回首次结果，不再采样或扣费。批内 <code>request_id</code> 必须唯一，且不能与既有单条/批量发布重复。</p>
+      <form id="batch-form">
+        <div class="form-grid">
+          <label>批次标识 batch_id<input id="batch-id" required></label>
+        </div>
+        <label>子请求 requests（JSON 数组，字段与单条发布一致）
+          <textarea id="batch-requests" spellcheck="false"></textarea>
+        </label>
+        <div class="share-actions" style="margin-top:10px;">
+          <button type="submit" id="batch-publish-button">整批发布</button>
+          <button type="button" class="secondary" id="batch-example-button">填入示例</button>
+        </div>
+      </form>
+      <div id="batch-message" role="status" aria-live="polite"></div>
+      <div id="batch-result"></div>
     </section>
 
     <section class="panel" aria-label="发布历史">
@@ -331,6 +360,110 @@
     });
 
     document.getElementById('request-id').value = newRequestId();
+
+    const batchIdInput = document.getElementById('batch-id');
+    const batchRequestsInput = document.getElementById('batch-requests');
+    const batchMessage = document.getElementById('batch-message');
+    const batchResult = document.getElementById('batch-result');
+
+    function exampleBatchRequests() {
+      const suffix1 = crypto.randomUUID ? crypto.randomUUID().slice(0, 8) : String(Date.now());
+      const suffix2 = crypto.randomUUID ? crypto.randomUUID().slice(-8) : String(Date.now() + 1);
+      return [
+        { request_id: `req-${suffix1}`, dataset_id: 'retail-demo', filters: { region: 'north' }, epsilon: 0.3 },
+        { request_id: `req-${suffix2}`, dataset_id: 'retail-demo', filters: null, epsilon: 0.2 },
+      ];
+    }
+
+    function fillBatchExample() {
+      batchIdInput.value = `batch-${crypto.randomUUID ? crypto.randomUUID().slice(0, 8) : Date.now()}`;
+      batchRequestsInput.value = JSON.stringify(exampleBatchRequests(), null, 2);
+    }
+
+    document.getElementById('batch-example-button').addEventListener('click', fillBatchExample);
+    fillBatchExample();
+
+    function renderBatchResult(data, replayed) {
+      batchResult.textContent = '';
+      const summary = document.createElement('div');
+      summary.className = 'batch-summary';
+      summary.textContent = `${replayed ? '重放首次响应（未采样、未扣费）' : '整批已提交'} · ${data.releases.length} 条 · 合计 ε=${data.total_epsilon} · 最终剩余预算 ${data.remaining_budget} · ${new Date(data.created_at).toLocaleString()}`;
+      batchResult.append(summary);
+      data.releases.forEach((release, index) => {
+        const card = document.createElement('div');
+        card.className = 'batch-item';
+        const head = document.createElement('div');
+        head.className = 'batch-item-head';
+        const order = document.createElement('strong');
+        order.textContent = `#${index + 1} 计数 ${release.published_count}`;
+        const rid = document.createElement('span');
+        rid.className = 'muted';
+        rid.textContent = `request_id=${release.request_id}`;
+        const filters = document.createElement('span');
+        filters.className = 'muted';
+        filters.textContent = describeFilters(release.filters);
+        const eps = document.createElement('span');
+        eps.className = 'muted';
+        eps.textContent = `ε=${release.epsilon}，扣后余额 ${release.remaining_budget}`;
+        head.append(order, rid, filters, eps);
+        card.append(head);
+        batchResult.append(card);
+      });
+    }
+
+    document.getElementById('batch-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = document.getElementById('batch-publish-button');
+      batchMessage.className = '';
+      batchMessage.textContent = '';
+      batchResult.textContent = '';
+      const batchId = batchIdInput.value.trim();
+      let requests;
+      try {
+        requests = JSON.parse(batchRequestsInput.value);
+      } catch (error) {
+        batchMessage.className = 'error';
+        batchMessage.textContent = `批量发布失败：requests 不是合法 JSON（${error.message}）。`;
+        return;
+      }
+      if (!Array.isArray(requests) || requests.length < 1 || requests.length > 20) {
+        batchMessage.className = 'error';
+        batchMessage.textContent = '批量发布失败：requests 必须是包含 1–20 项的 JSON 数组。';
+        return;
+      }
+      if (!batchId) {
+        batchMessage.className = 'error';
+        batchMessage.textContent = '批量发布失败：batch_id 必须是非空字符串。';
+        return;
+      }
+      const payload = { batch_id: batchId, requests };
+      button.disabled = true;
+      try {
+        const response = await fetch('/api/releases/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+          batchMessage.className = 'error';
+          batchMessage.textContent = `批量发布失败：${formatError(data, response.status)}`;
+          return;
+        }
+        batchMessage.className = 'success';
+        batchMessage.textContent = response.status === 200
+          ? '该 batch_id 已提交过，返回首次响应。'
+          : '整批发布成功。';
+        renderBatchResult(data, response.status === 200);
+        await Promise.all([refreshBudget(), refreshHistory()]);
+      } catch (error) {
+        batchMessage.className = 'error';
+        batchMessage.textContent = `批量发布失败：${error.message}`;
+      } finally {
+        button.disabled = false;
+      }
+    });
+
     loadCatalog();
     refreshBudget();
     refreshHistory();

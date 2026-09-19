@@ -13,19 +13,27 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from .database import (
     DATASET_ID,
     DEFAULT_EPSILON_BUDGET,
     PUBLIC_FILTER_FIELDS,
     ROOT,
+    BatchConflictError,
     BudgetExceededError,
     ReleaseConflictError,
     budget_status,
     canonical_filters,
     count_matching_members,
     create_release,
+    create_release_batch,
     create_share,
     get_share_by_token,
     initialize_database,
@@ -71,7 +79,45 @@ class ReleaseRequest(BaseModel):
         return value
 
 
+class BatchReleaseItem(ReleaseRequest):
+    """One release inside a batch: the single-release fields plus nothing else."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class BatchReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str
+    requests: list[BatchReleaseItem] = Field(min_length=1, max_length=20)
+
+    @field_validator("batch_id")
+    @classmethod
+    def batch_id_non_blank(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("batch_id 必须是非空字符串")
+        return value.strip()
+
+    @model_validator(mode="after")
+    def request_ids_unique_within_batch(self) -> "BatchReleaseRequest":
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for item in self.requests:
+            if item.request_id in seen:
+                duplicates.add(item.request_id)
+            seen.add(item.request_id)
+        if duplicates:
+            raise ValueError(
+                "批内 request_id 必须唯一，重复项: " + ", ".join(sorted(duplicates))
+            )
+        return self
+
+
 class RotateRequest(BaseModel):
+    # Tightened contract: rotation_id is the only accepted field, so an
+    # extra/typo key is a client error (422) instead of being ignored.
+    model_config = ConfigDict(extra="forbid")
+
     rotation_id: str
 
     @field_validator("rotation_id")
@@ -89,6 +135,14 @@ class ReleaseRecord(BaseModel):
     filters: dict[str, str]
     epsilon: float
     published_count: int
+    remaining_budget: float
+    created_at: str
+
+
+class BatchReleaseResponse(BaseModel):
+    batch_id: str
+    releases: list[ReleaseRecord]
+    total_epsilon: float
     remaining_budget: float
     created_at: str
 
@@ -251,6 +305,69 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         if not created:
             response.status_code = 200
         return record
+
+    @application.post(
+        "/api/releases/batch", response_model=BatchReleaseResponse, status_code=201
+    )
+    def publish_release_batch(request: BatchReleaseRequest, response: Response) -> dict:
+        # Every sub-item targets the one supported dataset: any other
+        # dataset_id rejects the whole batch with 404 before any state or
+        # budget is touched (the single-release rule, applied wholesale).
+        for item in request.requests:
+            if item.dataset_id != DATASET_ID:
+                raise HTTPException(
+                    status_code=404, detail=f"未知数据集：{item.dataset_id}"
+                )
+        # True counts come from member data, which never leaves this call:
+        # only the noisy per-item counts enter the stored records and the
+        # response. Counts are gathered before the write transaction so the
+        # transaction stays short; no noise is sampled until the batch has
+        # confirmed inside the transaction that every identity is free and
+        # the total epsilon fits the balance.
+        items = [
+            {
+                "request_id": item.request_id,
+                "dataset_id": item.dataset_id,
+                "filters": item.filters or {},
+                "epsilon": item.epsilon,
+                "true_count": count_matching_members(path, item.filters or {}),
+            }
+            for item in request.requests
+        ]
+        try:
+            header, records, created = create_release_batch(
+                path,
+                batch_id=request.batch_id,
+                items=items,
+                budget=epsilon_budget,
+                sample_count=_noisy_count,
+            )
+        except BatchConflictError as error:
+            if error.reason == "request_id_occupied":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"request_id {error.detail} 已被单条或批量发布占用，"
+                        "整批未记录"
+                    ),
+                ) from None
+            raise HTTPException(
+                status_code=409,
+                detail="batch_id 已用于不同的请求，请更换标识，整批未记录",
+            ) from None
+        except BudgetExceededError:
+            raise HTTPException(
+                status_code=409, detail="隐私预算不足，整批发布未记录"
+            ) from None
+        if not created:
+            response.status_code = 200
+        return {
+            "batch_id": header["batch_id"],
+            "releases": records,
+            "total_epsilon": header["total_epsilon"],
+            "remaining_budget": header["remaining_budget"],
+            "created_at": header["created_at"],
+        }
 
     @application.get("/api/privacy-budget", response_model=PrivacyBudget)
     def privacy_budget() -> dict:

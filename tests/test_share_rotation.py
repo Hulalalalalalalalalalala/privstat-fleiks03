@@ -126,6 +126,38 @@ class RotateEndpointTests(unittest.TestCase):
                     )
                     self.assertEqual(status, 422)
 
+    def test_extra_fields_return_422_and_change_nothing(self):
+        with running_demo(0) as base_url:
+            status, body = create_share(base_url)
+            share = json.loads(body)
+            for payload in (
+                {"rotation_id": "rot-extra", "unexpected": 1},
+                {"rotation_id": "rot-extra", "rotationId": "rot-other"},
+                {"rotation_id": "rot-extra", "share_id": "some-other-share"},
+            ):
+                with self.subTest(payload=payload):
+                    status, _ = request(
+                        base_url,
+                        "POST",
+                        f"/api/shares/id/{share['share_id']}/rotate",
+                        payload,
+                    )
+                    self.assertEqual(status, 422)
+            # No rotation happened: the original token still works.
+            status, _ = request(
+                base_url, "GET", f"/api/shares/{share['token']}/releases"
+            )
+            self.assertEqual(status, 200)
+            # The rejected rotation_id was never consumed.
+            status, body = request(
+                base_url,
+                "POST",
+                f"/api/shares/id/{share['share_id']}/rotate",
+                {"rotation_id": "rot-extra"},
+            )
+            self.assertEqual(status, 201)
+            self.assertEqual(json.loads(body)["token_version"], 2)
+
     def test_revoked_share_returns_409_and_keeps_state(self):
         with running_demo(0) as base_url:
             status, body = create_share(base_url)
