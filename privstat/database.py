@@ -78,6 +78,18 @@ _SHARE_TOKENS_COLUMNS_SQL = (
     "PRIMARY KEY (share_id, token_version))"
 )
 
+# One row per partner access to a share link, whether it was served or
+# refused. Only the event metadata is stored: the raw token and its digest
+# never appear here, so the audit log cannot be used to replay a link.
+SHARE_ACCESS_OUTCOMES = ("served", "expired", "revoked", "superseded")
+
+_SHARE_ACCESS_EVENTS_COLUMNS_SQL = (
+    "CREATE TABLE IF NOT EXISTS share_access_events ("
+    "event_id TEXT PRIMARY KEY, share_id TEXT NOT NULL, "
+    "token_version INTEGER NOT NULL, outcome TEXT NOT NULL, "
+    "result_count INTEGER NOT NULL, accessed_at TEXT NOT NULL)"
+)
+
 
 def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
@@ -228,6 +240,11 @@ def initialize_database(path: Path) -> None:
                 "INSERT OR IGNORE INTO share_tokens "
                 "(share_id, token_version, token_digest, rotation_id, rotated_at) "
                 "SELECT share_id, 1, token_digest, NULL, created_at FROM shares"
+            )
+            connection.execute(_SHARE_ACCESS_EVENTS_COLUMNS_SQL)
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_share_access_events_accessed_at "
+                "ON share_access_events (accessed_at DESC)"
             )
             if not connection.execute(
                 "SELECT 1 FROM datasets WHERE id = ?", (DATASET_ID,)
@@ -934,3 +951,97 @@ def list_shares(
             }
         )
     return records
+
+
+def record_share_access_event(
+    path: Path,
+    *,
+    share_id: str,
+    token_version: int,
+    outcome: str,
+    result_count: int,
+) -> dict:
+    """Append one audit event for a partner access to a share link.
+
+    Each call inserts exactly one row, so concurrent accesses each leave
+    their own event. The write touches only the share_access_events table:
+    share state, budget and release history are never modified, and member
+    data is never read. A failure raises, so the caller can refuse to serve
+    share data when the audit trail cannot be written.
+    """
+    record = {
+        "event_id": uuid.uuid4().hex,
+        "share_id": share_id,
+        "token_version": token_version,
+        "outcome": outcome,
+        "result_count": result_count,
+        "accessed_at": _utc_iso(datetime.now(timezone.utc)),
+    }
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "INSERT INTO share_access_events "
+            "(event_id, share_id, token_version, outcome, result_count, "
+            "accessed_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                record["event_id"],
+                record["share_id"],
+                record["token_version"],
+                record["outcome"],
+                record["result_count"],
+                record["accessed_at"],
+            ),
+        )
+    return record
+
+
+def query_share_access_events(
+    path: Path,
+    *,
+    share_id: str | None = None,
+    outcome: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Read-only filtered view of share access events, newest first.
+
+    The window is [start, end) compared against accessed_at in UTC. Only
+    the event fields are returned; tokens and token digests are not part
+    of the table and can never leak through this listing. Querying does
+    not record a new event.
+    """
+    clauses: list[str] = []
+    parameters: list[object] = []
+    if share_id is not None:
+        clauses.append("share_id = ?")
+        parameters.append(share_id)
+    if outcome is not None:
+        clauses.append("outcome = ?")
+        parameters.append(outcome)
+    if start is not None:
+        clauses.append("accessed_at >= ?")
+        parameters.append(_utc_iso(start))
+    if end is not None:
+        clauses.append("accessed_at < ?")
+        parameters.append(_utc_iso(end))
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    with closing(sqlite3.connect(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT event_id, share_id, token_version, outcome, result_count, "
+            "accessed_at FROM share_access_events"
+            + where
+            + " ORDER BY accessed_at DESC, rowid DESC LIMIT ?",
+            (*parameters, limit),
+        ).fetchall()
+    return [
+        {
+            "event_id": row["event_id"],
+            "share_id": row["share_id"],
+            "token_version": row["token_version"],
+            "outcome": row["outcome"],
+            "result_count": row["result_count"],
+            "accessed_at": row["accessed_at"],
+        }
+        for row in rows
+    ]

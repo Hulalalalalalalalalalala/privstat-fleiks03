@@ -39,6 +39,9 @@
     #release-message.error, #export-message.error, #share-message.error { color: #9b2c2c; }
     #release-message.success, #export-message.success, #share-message.success { color: #236345; }
     #export-message, #share-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
+    #audit-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
+    #audit-message.error { color: #9b2c2c; }
+    #audit-message.success { color: #236345; }
     .release-card { padding: 18px 20px; }
     .release-card h3 { margin: 0 0 8px; font-size: 16px; }
     .release-card dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 6px 18px; margin: 0; font-size: 13px; }
@@ -199,6 +202,32 @@
       <div id="managed-message" role="status" aria-live="polite"></div>
       <div id="managed-rotate-result" role="status" aria-live="polite"></div>
       <div id="managed-shares"></div>
+    </section>
+
+    <section class="panel" aria-label="分享访问审计">
+      <div class="eyebrow">ACCESS AUDIT</div>
+      <h2>分享访问审计</h2>
+      <p class="intro">记录合作方链接的每次访问：成功（served）、已过期（expired）、已撤销（revoked）、旧代令牌（superseded）。事件仅含事件字段，不包含也不显示访问令牌或其摘要。</p>
+      <form id="audit-form">
+        <div class="form-grid">
+          <label>share_id（可选，精确匹配）<input id="audit-share-id" placeholder="留空表示全部"></label>
+          <label>结果 outcome
+            <select id="audit-outcome">
+              <option value="">全部结果</option>
+              <option value="served">served（成功）</option>
+              <option value="expired">expired（已过期）</option>
+              <option value="revoked">revoked（已撤销）</option>
+              <option value="superseded">superseded（旧代令牌）</option>
+            </select>
+          </label>
+          <label>起始时间 from（包含，可选）<input id="audit-from" type="datetime-local" step="1"></label>
+          <label>结束时间 to（不包含，可选）<input id="audit-to" type="datetime-local" step="1"></label>
+          <label>条数 limit（1–100）<input id="audit-limit" type="number" min="1" max="100" value="50"></label>
+        </div>
+        <button type="submit" id="audit-button">查询事件</button>
+      </form>
+      <div id="audit-message" role="status" aria-live="polite"></div>
+      <div id="audit-events"></div>
     </section>
 
     <footer>当前使用合成零售样例，不包含真实客户数据。</footer>
@@ -921,6 +950,95 @@
     document.getElementById('share-status-filter').addEventListener('change', loadManagedShares);
     document.getElementById('share-refresh-button').addEventListener('click', loadManagedShares);
     loadManagedShares();
+
+    const OUTCOME_LABELS = {
+      served: '成功',
+      expired: '已过期',
+      revoked: '已撤销',
+      superseded: '旧代令牌',
+    };
+
+    document.getElementById('audit-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const message = document.getElementById('audit-message');
+      const container = document.getElementById('audit-events');
+      const button = document.getElementById('audit-button');
+      const params = new URLSearchParams();
+      const shareId = document.getElementById('audit-share-id').value.trim();
+      if (shareId) params.set('share_id', shareId);
+      const outcome = document.getElementById('audit-outcome').value;
+      if (outcome) params.set('outcome', outcome);
+      const fromIso = localInputToIso(document.getElementById('audit-from').value);
+      const toIso = localInputToIso(document.getElementById('audit-to').value);
+      if (fromIso) params.set('from', fromIso);
+      if (toIso) params.set('to', toIso);
+      const limitRaw = document.getElementById('audit-limit').value;
+      const limit = Number.parseInt(limitRaw, 10);
+      message.className = '';
+      message.textContent = '';
+      container.textContent = '';
+      if (limitRaw === '' || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+        message.className = 'error';
+        message.textContent = '查询失败：limit 必须是 1–100 的整数。';
+        return;
+      }
+      params.set('limit', String(limit));
+      if (fromIso && toIso && new Date(fromIso) >= new Date(toIso)) {
+        message.className = 'error';
+        message.textContent = '查询失败：起始时间必须早于结束时间。';
+        return;
+      }
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/share-access-events?${params.toString()}`);
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+          message.className = 'error';
+          message.textContent = `查询失败：${formatError(data, response.status)}`;
+          return;
+        }
+        if (!data.length) {
+          message.className = '';
+          message.textContent = '没有匹配的访问事件。';
+          return;
+        }
+        message.className = 'success';
+        message.textContent = `共 ${data.length} 条访问事件（按访问时间倒序）。`;
+        for (const item of data) {
+          const card = document.createElement('article');
+          card.className = 'release-card';
+          const title = document.createElement('h3');
+          const badge = document.createElement('span');
+          badge.className = 'status-badge ' + (
+            item.outcome === 'served' ? 'status-active' : 'status-revoked'
+          );
+          badge.textContent = `${item.outcome}（${OUTCOME_LABELS[item.outcome] || item.outcome}）`;
+          title.append('访问事件 ', badge);
+          const details = document.createElement('dl');
+          const items = [
+            ['访问时间', new Date(item.accessed_at).toLocaleString()],
+            ['返回条数', item.result_count],
+            ['令牌代次', `第 ${item.token_version} 代`],
+            ['share_id', item.share_id],
+            ['event_id', item.event_id],
+          ];
+          for (const [label, value] of items) {
+            const dt = document.createElement('dt');
+            dt.textContent = label;
+            const dd = document.createElement('dd');
+            dd.textContent = value;
+            details.append(dt, dd);
+          }
+          card.append(title, details);
+          container.append(card);
+        }
+      } catch (error) {
+        message.className = 'error';
+        message.textContent = `查询失败：${error.message}`;
+      } finally {
+        button.disabled = false;
+      }
+    });
 
     setInterval(() => {
       renderShares();

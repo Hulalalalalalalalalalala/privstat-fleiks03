@@ -26,6 +26,7 @@ from .database import (
     DEFAULT_EPSILON_BUDGET,
     PUBLIC_FILTER_FIELDS,
     ROOT,
+    SHARE_ACCESS_OUTCOMES,
     BatchConflictError,
     BudgetExceededError,
     ReleaseConflictError,
@@ -41,6 +42,8 @@ from .database import (
     list_releases,
     list_shares,
     query_releases,
+    query_share_access_events,
+    record_share_access_event,
     revoke_share,
     revoke_share_by_id,
     rotate_share,
@@ -151,6 +154,16 @@ class PrivacyBudget(BaseModel):
     initial_budget: float
     used_budget: float
     remaining_budget: float
+
+
+class ShareAccessEvent(BaseModel):
+    # The complete audit record shape: no token, no token digest.
+    event_id: str
+    share_id: str
+    token_version: int
+    outcome: str
+    result_count: int
+    accessed_at: str
 
 
 def _parse_share_time(raw: object, name: str) -> datetime:
@@ -518,23 +531,91 @@ def create_app(database_path: Path | None = None) -> FastAPI:
     def shared_releases(token: str) -> list[dict]:
         share = get_share_by_token(path, token)
         if share is None:
+            # Unknown tokens are not auditable to a share, so no event.
             raise HTTPException(status_code=404, detail="未知分享")
         now = datetime.now(timezone.utc)
+        detail: str | None = None
         if share["revoked_at"] is not None:
-            raise HTTPException(status_code=410, detail="分享已撤销")
-        if datetime.fromisoformat(share["expires_at"]) <= now:
-            raise HTTPException(status_code=410, detail="分享已过期")
-        if not share["token_current"]:
-            raise HTTPException(status_code=410, detail="分享凭证已轮换，旧令牌已失效")
-        # Read-only view over the releases table: no budget is deducted, no
-        # release record is created, and member-level data is never read.
-        return query_releases(
+            outcome, detail = "revoked", "分享已撤销"
+        elif datetime.fromisoformat(share["expires_at"]) <= now:
+            outcome, detail = "expired", "分享已过期"
+        elif not share["token_current"]:
+            outcome, detail = "superseded", "分享凭证已轮换，旧令牌已失效"
+        else:
+            outcome = "served"
+        records: list[dict] = []
+        if outcome == "served":
+            # Read-only view over the releases table: no budget is
+            # deducted, no release record is created, and member-level
+            # data is never read.
+            records = query_releases(
+                path,
+                dataset_id=share["dataset_id"],
+                request_id=share["request_id"],
+                start=datetime.fromisoformat(share["from"]) if share["from"] else None,
+                end=datetime.fromisoformat(share["to"]) if share["to"] else None,
+                limit=share["limit"],
+            )
+        try:
+            record_share_access_event(
+                path,
+                share_id=share["share_id"],
+                token_version=share["token_version"],
+                outcome=outcome,
+                result_count=len(records),
+            )
+        except Exception:
+            # The audit write is part of serving the link: if it fails,
+            # the share data must not leave the server.
+            raise HTTPException(
+                status_code=500, detail="访问审计写入失败，本次访问未提供数据"
+            ) from None
+        if detail is not None:
+            raise HTTPException(status_code=410, detail=detail)
+        return records
+
+    @application.get(
+        "/api/share-access-events", response_model=list[ShareAccessEvent]
+    )
+    def share_access_events(
+        share_id: str | None = Query(default=None),
+        outcome: str | None = Query(default=None),
+        from_time: str | None = Query(default=None, alias="from"),
+        to_time: str | None = Query(default=None, alias="to"),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> list[dict]:
+        if share_id is not None:
+            share_id = share_id.strip()
+            if not share_id:
+                raise HTTPException(
+                    status_code=422, detail="share_id 必须是非空字符串"
+                )
+        if outcome is not None and outcome not in SHARE_ACCESS_OUTCOMES:
+            raise HTTPException(
+                status_code=422,
+                detail="outcome 只能是 " + "、".join(SHARE_ACCESS_OUTCOMES),
+            )
+        try:
+            start = (
+                _parse_share_time(from_time, "from")
+                if from_time is not None
+                else None
+            )
+            end = (
+                _parse_share_time(to_time, "to") if to_time is not None else None
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        if start is not None and end is not None and start >= end:
+            raise HTTPException(status_code=422, detail="from 必须早于 to")
+        # Purely read-only: listing events never records a new one.
+        return query_share_access_events(
             path,
-            dataset_id=share["dataset_id"],
-            request_id=share["request_id"],
-            start=datetime.fromisoformat(share["from"]) if share["from"] else None,
-            end=datetime.fromisoformat(share["to"]) if share["to"] else None,
-            limit=share["limit"],
+            share_id=share_id,
+            outcome=outcome,
+            start=start,
+            end=end,
+            limit=limit,
         )
 
     @application.post("/api/shares/id/{share_id}/rotate", status_code=201)
