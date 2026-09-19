@@ -51,6 +51,18 @@ _SHARES_INSERT_COLUMNS = (
     "result_limit, created_at, expires_at, revoked_at"
 )
 
+# One row per token generation: generation 1 is the original token from
+# create_share, each successful rotation appends the next version. Only the
+# SHA-256 digest is stored; the plaintext token leaves the server exactly
+# once, inside the 201 response of the request that created the generation.
+_SHARE_TOKENS_COLUMNS_SQL = (
+    "CREATE TABLE IF NOT EXISTS share_tokens ("
+    "share_id TEXT NOT NULL, token_version INTEGER NOT NULL, "
+    "token_digest TEXT NOT NULL UNIQUE, rotation_id TEXT, "
+    "rotated_at TEXT NOT NULL, "
+    "PRIMARY KEY (share_id, token_version))"
+)
+
 
 def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
@@ -161,6 +173,21 @@ def initialize_database(path: Path) -> None:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_shares_created_at "
                 "ON shares (created_at DESC)"
+            )
+            connection.execute(_SHARE_TOKENS_COLUMNS_SQL)
+            # Idempotency key for rotations: one generation per rotation_id.
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_share_tokens_rotation "
+                "ON share_tokens (share_id, rotation_id) "
+                "WHERE rotation_id IS NOT NULL"
+            )
+            # Backfill generation 1 for shares created before token
+            # generations existed; the original token digest becomes
+            # version 1. Idempotent via the primary key.
+            connection.execute(
+                "INSERT OR IGNORE INTO share_tokens "
+                "(share_id, token_version, token_digest, rotation_id, rotated_at) "
+                "SELECT share_id, 1, token_digest, NULL, created_at FROM shares"
             )
             if not connection.execute(
                 "SELECT 1 FROM datasets WHERE id = ?", (DATASET_ID,)
@@ -445,24 +472,58 @@ def create_share(
                 record["revoked_at"],
             ),
         )
+        # The original token is generation 1 of the share.
+        connection.execute(
+            "INSERT INTO share_tokens "
+            "(share_id, token_version, token_digest, rotation_id, rotated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                record["share_id"],
+                1,
+                hash_token(token),
+                None,
+                record["created_at"],
+            ),
+        )
     return record
 
 
 def get_share_by_token(path: Path, token: str) -> dict | None:
+    """Resolve a raw token of any generation to its share.
+
+    The returned record carries ``token_version`` and ``token_current``:
+    a superseded generation still resolves (so callers can answer 410
+    instead of 404) but reports ``token_current`` as False. The current
+    generation is the one whose digest is mirrored on the shares row.
+    """
+    digest = hash_token(token)
     with closing(sqlite3.connect(path)) as connection:
         connection.row_factory = sqlite3.Row
         row = connection.execute(
-            "SELECT * FROM shares WHERE token_digest = ?", (hash_token(token),)
+            "SELECT s.*, t.token_version, "
+            "(t.token_digest = s.token_digest) AS token_current "
+            "FROM share_tokens t "
+            "JOIN shares s ON s.share_id = t.share_id "
+            "WHERE t.token_digest = ?",
+            (digest,),
         ).fetchone()
-    return _share_from_row(row) if row is not None else None
+    if row is None:
+        return None
+    share = _share_from_row(row)
+    share["token_version"] = row["token_version"]
+    share["token_current"] = bool(row["token_current"])
+    return share
 
 
 def revoke_share(path: Path, token: str) -> bool:
     """Atomically mark a share revoked, looked up by raw token digest.
 
-    Revoking an already-revoked share succeeds again (idempotent); the
-    original revocation time is kept. Returns True when a matching share
-    exists (including when it was already revoked).
+    Only the current generation's token revokes the share: a superseded
+    token matches nothing on the shares row and leaves the share
+    untouched. Revoking an already-revoked share succeeds again
+    (idempotent); the original revocation time is kept. Returns True when
+    the token is the share's current token (including when the share was
+    already revoked).
     """
     now = _utc_iso(datetime.now(timezone.utc))
     with closing(sqlite3.connect(path)) as connection:
@@ -507,6 +568,89 @@ def revoke_share_by_id(path: Path, share_id: str) -> bool:
             ).fetchone()
             connection.execute("COMMIT")
             return exists is not None
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+
+def rotate_share(path: Path, *, share_id: str, rotation_id: str) -> tuple[str, dict | None]:
+    """Atomically rotate a share's token to the next generation.
+
+    Returns (status, record). Statuses:
+
+    - "created": a new generation was committed; the record includes the
+      plaintext token (returned to the caller exactly once), token_version
+      and rotated_at. The previous generation stops being current in the
+      same transaction, so at most one generation is ever valid.
+    - "replayed": this rotation_id already succeeded on this share; the
+      record carries the original metadata without the token and no state
+      changes. This check runs before the revoked/expired checks, so a
+      retry of a committed rotation always replays.
+    - "not_found": no share with this share_id.
+    - "inactive": the share is revoked or expired at the current UTC
+      instant; nothing is written.
+
+    BEGIN IMMEDIATE serializes rotations, so concurrent requests with the
+    same rotation_id commit exactly one new generation. Only the SHA-256
+    digest of each generation is persisted. Scope, expiry and share_id are
+    untouched, and no member data, budget or release records are involved.
+    """
+    now = _utc_iso(datetime.now(timezone.utc))
+    with closing(sqlite3.connect(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.isolation_level = None
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            share = connection.execute(
+                "SELECT * FROM shares WHERE share_id = ?", (share_id,)
+            ).fetchone()
+            if share is None:
+                connection.execute("COMMIT")
+                return "not_found", None
+            existing = connection.execute(
+                "SELECT token_version, rotated_at FROM share_tokens "
+                "WHERE share_id = ? AND rotation_id = ?",
+                (share_id, rotation_id),
+            ).fetchone()
+            if existing is not None:
+                connection.execute("COMMIT")
+                return "replayed", {
+                    "share_id": share_id,
+                    "rotation_id": rotation_id,
+                    "token_version": existing["token_version"],
+                    "rotated_at": existing["rotated_at"],
+                }
+            if share["revoked_at"] is not None or share["expires_at"] <= now:
+                connection.execute("COMMIT")
+                return "inactive", None
+            version = connection.execute(
+                "SELECT COALESCE(MAX(token_version), 0) + 1 FROM share_tokens "
+                "WHERE share_id = ?",
+                (share_id,),
+            ).fetchone()[0]
+            token = secrets.token_urlsafe(32)
+            digest = hash_token(token)
+            connection.execute(
+                "INSERT INTO share_tokens "
+                "(share_id, token_version, token_digest, rotation_id, rotated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (share_id, version, digest, rotation_id, now),
+            )
+            # The shares row always mirrors the current generation's
+            # digest, which is what token-based revocation matches on.
+            connection.execute(
+                "UPDATE shares SET token_digest = ? WHERE share_id = ?",
+                (digest, share_id),
+            )
+            connection.execute("COMMIT")
+            return "created", {
+                "share_id": share_id,
+                "rotation_id": rotation_id,
+                "token": token,
+                "token_version": version,
+                "rotated_at": now,
+            }
         except BaseException:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")

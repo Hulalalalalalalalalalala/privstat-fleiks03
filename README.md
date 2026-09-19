@@ -28,9 +28,11 @@ python3 -m venv .venv
 
 `DELETE /api/shares/id/{share_id}` 按 `share_id` 撤销：对已存在的分享原子、幂等返回 204（重复撤销保留首次 `revoked_at`），未知 `share_id` 返回 404；提交后通过 token 访问返回 410，并发撤销只形成一个持久状态。`DELETE /api/shares/{token}` 按原始 token 撤销，同样原子幂等，**对未知 token 也返回 204**（无法借此探测 token 是否存在）。
 
+`POST /api/shares/id/{share_id}/rotate` 轮换分享凭证：请求体仅含非空字符串 `rotation_id`。原始 token 为第 1 代，每次成功轮换在最高版本上加一（首次返回 `token_version=2`），在单事务内生成新 token 并使旧代失效，返回 201 及 `share_id`、`rotation_id`、`token`、`token_version`、UTC 微秒级 `rotated_at`；范围、期限与 `share_id` 不变。**新 token 仅在此 201 响应中出现一次**，SQLite 的 `share_tokens` 表只保存各代 token 的 SHA-256 摘要。此后仅新 token 可访问，旧 token 访问返回 410；旧 token 撤销仍返回 204 且不影响当前分享，当前 token 与 `share_id` 撤销沿用原语义。未知 `share_id` 返回 404；分享已撤销或按当前 UTC 已过期时，未成功过的 `rotation_id` 返回 409 且状态不变。同一分享的 `rotation_id` 幂等：成功后的重试优先于过期、撤销判定，固定返回 200 及原元数据（不含 token），不改变状态；并发同标识只生成一代，任何时刻至多一代有效，代际、幂等与失效状态重启后保持。轮换不读取 `retail_members`、不扣减预算、不新增发布记录，token 与摘要不会进入列表、历史或导出。
+
 启动时把既有发布记录的 `created_at` 回填为可索引的 UTC 微秒 ISO 字符串并建立索引；导出与分享范围的时间窗口（前含后不含）、倒序与限量均在数据库内完成，精确到实际时刻、不截断到毫秒。启动时还会幂等迁移旧库 `shares` 表中的明文 token：整表重命名后逐行写入 SHA-256 摘要，整个迁移在单事务内完成，失败即回滚（不丢失任何分享），成功后 `VACUUM` 清除文件中的明文残留；旧链接凭原 token 仍可访问与撤销，任何接口都不会泄露摘要。
 
-首页在既有创建/复制/撤销能力之外，新增分享管理区：从服务端加载分享列表、按状态筛选、按 `share_id` 撤销；管理操作只读 `shares` 表，不读取 `retail_members`、不扣减预算、不新增发布记录。
+首页在既有创建/复制/撤销能力之外，新增分享管理区：从服务端加载分享列表、按状态筛选、按 `share_id` 撤销；管理操作只读 `shares` 表，不读取 `retail_members`、不扣减预算、不新增发布记录。创建区与管理区均提供凭证轮换：自动生成 `rotation_id` 提交轮换，成功后在页面上一次性展示新令牌并提供复制按钮，轮换失败（如分享已撤销或过期）显示可读错误。
 
 启动时将 `data/retail_members.csv` 导入 SQLite，默认数据库为 `.runtime/privstat.sqlite3`；可用 `PRIVSTAT_DATABASE_PATH` 指定其他路径。重复启动保留已有记录。
 

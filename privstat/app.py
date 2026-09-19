@@ -35,6 +35,7 @@ from .database import (
     query_releases,
     revoke_share,
     revoke_share_by_id,
+    rotate_share,
 )
 
 
@@ -68,6 +69,17 @@ class ReleaseRequest(BaseModel):
         if unsupported:
             raise ValueError(f"不支持的筛选字段: {', '.join(unsupported)}")
         return value
+
+
+class RotateRequest(BaseModel):
+    rotation_id: str
+
+    @field_validator("rotation_id")
+    @classmethod
+    def rotation_id_non_blank(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("rotation_id 必须是非空字符串")
+        return value.strip()
 
 
 class ReleaseRecord(BaseModel):
@@ -395,6 +407,8 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=410, detail="分享已撤销")
         if datetime.fromisoformat(share["expires_at"]) <= now:
             raise HTTPException(status_code=410, detail="分享已过期")
+        if not share["token_current"]:
+            raise HTTPException(status_code=410, detail="分享凭证已轮换，旧令牌已失效")
         # Read-only view over the releases table: no budget is deducted, no
         # release record is created, and member-level data is never read.
         return query_releases(
@@ -405,6 +419,24 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             end=datetime.fromisoformat(share["to"]) if share["to"] else None,
             limit=share["limit"],
         )
+
+    @application.post("/api/shares/id/{share_id}/rotate", status_code=201)
+    def rotate_partner_share(share_id: str, request: RotateRequest, response: Response) -> dict:
+        # A committed rotation_id replays before any revoked/expired
+        # check, so retries of a successful rotation always return 200
+        # with the original metadata (and never the token again).
+        status, record = rotate_share(
+            path, share_id=share_id, rotation_id=request.rotation_id
+        )
+        if status == "not_found":
+            raise HTTPException(status_code=404, detail="未知分享")
+        if status == "inactive":
+            raise HTTPException(
+                status_code=409, detail="分享已撤销或已过期，无法轮换凭证"
+            )
+        if status == "replayed":
+            response.status_code = 200
+        return record
 
     @application.delete("/api/shares/id/{share_id}", status_code=204)
     def revoke_partner_share_by_id(share_id: str) -> Response:
