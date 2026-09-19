@@ -2,6 +2,7 @@
 
 import csv
 import json
+import secrets
 import sqlite3
 import uuid
 from contextlib import closing
@@ -46,6 +47,14 @@ def initialize_database(path: Path) -> None:
             "dataset_id TEXT NOT NULL, filters_json TEXT NOT NULL, "
             "epsilon REAL NOT NULL, published_count INTEGER NOT NULL, "
             "remaining_budget REAL NOT NULL, created_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS shares ("
+            "share_id TEXT PRIMARY KEY, token TEXT NOT NULL UNIQUE, "
+            "dataset_id TEXT NOT NULL, request_id TEXT, "
+            "from_time TEXT, to_time TEXT, result_limit INTEGER NOT NULL, "
+            "created_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
+            "revoked_at TEXT)"
         )
         if connection.execute(
             "SELECT 1 FROM datasets WHERE id = ?", (DATASET_ID,)
@@ -217,7 +226,9 @@ def query_releases(
 
     Only the releases table is read; member-level data is never touched.
     The window is [start, end) compared against created_at in UTC, and
-    results are newest first, capped at ``limit`` rows.
+    results are newest first, capped at ``limit`` rows. Time bounds are
+    compared at full precision against the actual stored instants, never
+    truncated to milliseconds.
     """
     clauses: list[str] = []
     parameters: list[object] = []
@@ -227,22 +238,28 @@ def query_releases(
     if request_id is not None:
         clauses.append("request_id = ?")
         parameters.append(request_id)
-    if start is not None:
-        clauses.append("created_at >= ?")
-        parameters.append(start.astimezone(timezone.utc).isoformat(timespec="milliseconds"))
-    if end is not None:
-        clauses.append("created_at < ?")
-        parameters.append(end.astimezone(timezone.utc).isoformat(timespec="milliseconds"))
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    query = (
-        "SELECT * FROM releases"
-        + where
-        + " ORDER BY created_at DESC, rowid DESC LIMIT ?"
-    )
+    query = "SELECT * FROM releases" + where + " ORDER BY created_at DESC, rowid DESC"
+    if start is None and end is None:
+        query += " LIMIT ?"
+        parameters.append(limit)
     with closing(sqlite3.connect(path)) as connection:
         connection.row_factory = sqlite3.Row
-        rows = connection.execute(query, (*parameters, limit)).fetchall()
-    return [_release_from_row(row) for row in rows]
+        rows = connection.execute(query, tuple(parameters)).fetchall()
+    records = [_release_from_row(row) for row in rows]
+    if start is not None or end is not None:
+        # Compare exact instants in Python: stored created_at strings keep
+        # their own precision, so lexicographic SQL comparison would be
+        # wrong for bounds with finer precision than the stored values.
+        start_utc = start.astimezone(timezone.utc) if start is not None else None
+        end_utc = end.astimezone(timezone.utc) if end is not None else None
+        records = [
+            record
+            for record in records
+            if (start_utc is None or datetime.fromisoformat(record["created_at"]) >= start_utc)
+            and (end_utc is None or datetime.fromisoformat(record["created_at"]) < end_utc)
+        ][:limit]
+    return records
 
 
 def budget_status(path: Path, budget: float) -> dict:
@@ -256,3 +273,106 @@ def budget_status(path: Path, budget: float) -> dict:
         "used_budget": used,
         "remaining_budget": max(0.0, round(budget - used, _BUDGET_PRECISION)),
     }
+
+
+def _utc_iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _share_from_row(row: sqlite3.Row) -> dict:
+    return {
+        "share_id": row["share_id"],
+        "token": row["token"],
+        "dataset_id": row["dataset_id"],
+        "request_id": row["request_id"],
+        "from": row["from_time"],
+        "to": row["to_time"],
+        "limit": row["result_limit"],
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"],
+        "revoked_at": row["revoked_at"],
+    }
+
+
+def create_share(
+    path: Path,
+    *,
+    dataset_id: str,
+    request_id: str | None,
+    start: datetime | None,
+    end: datetime | None,
+    limit: int,
+    expires_at: datetime,
+) -> dict:
+    """Persist a share scope and return the stored record.
+
+    The token is an unguessable random string; it only ever lives in the
+    shares table, never in the release history or exports.
+    """
+    record = {
+        "share_id": uuid.uuid4().hex,
+        "token": secrets.token_urlsafe(32),
+        "dataset_id": dataset_id,
+        "request_id": request_id,
+        "from": _utc_iso(start) if start is not None else None,
+        "to": _utc_iso(end) if end is not None else None,
+        "limit": limit,
+        "created_at": _utc_iso(datetime.now(timezone.utc)),
+        "expires_at": _utc_iso(expires_at),
+        "revoked_at": None,
+    }
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "INSERT INTO shares (share_id, token, dataset_id, request_id, "
+            "from_time, to_time, result_limit, created_at, expires_at, "
+            "revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record["share_id"],
+                record["token"],
+                record["dataset_id"],
+                record["request_id"],
+                record["from"],
+                record["to"],
+                record["limit"],
+                record["created_at"],
+                record["expires_at"],
+                record["revoked_at"],
+            ),
+        )
+    return record
+
+
+def get_share_by_token(path: Path, token: str) -> dict | None:
+    with closing(sqlite3.connect(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM shares WHERE token = ?", (token,)
+        ).fetchone()
+    return _share_from_row(row) if row is not None else None
+
+
+def revoke_share(path: Path, token: str) -> bool:
+    """Atomically mark a share revoked. Returns False for unknown tokens.
+
+    Revoking an already-revoked share succeeds again (idempotent); the
+    original revocation time is kept.
+    """
+    now = _utc_iso(datetime.now(timezone.utc))
+    with closing(sqlite3.connect(path)) as connection:
+        connection.isolation_level = None
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "UPDATE shares SET revoked_at = ? "
+                "WHERE token = ? AND revoked_at IS NULL",
+                (now, token),
+            )
+            exists = connection.execute(
+                "SELECT 1 FROM shares WHERE token = ?", (token,)
+            ).fetchone()
+            connection.execute("COMMIT")
+            return exists is not None
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise

@@ -26,10 +26,13 @@ from .database import (
     canonical_filters,
     count_matching_members,
     create_release,
+    create_share,
+    get_share_by_token,
     initialize_database,
     list_datasets,
     list_releases,
     query_releases,
+    revoke_share,
 )
 
 
@@ -80,6 +83,55 @@ class PrivacyBudget(BaseModel):
     initial_budget: float
     used_budget: float
     remaining_budget: float
+
+
+def _parse_share_time(raw: object, name: str) -> datetime:
+    if not isinstance(raw, str):
+        raise ValueError(f"{name} 必须是 ISO-8601 时间字符串，例如 2026-01-01T00:00:00Z")
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        raise ValueError(f"{name} 必须是 ISO-8601 时间，例如 2026-01-01T00:00:00Z") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{name} 必须包含时区，例如 2026-01-01T00:00:00Z")
+    return parsed.astimezone(timezone.utc)
+
+
+class ShareRequest(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    dataset_id: str
+    request_id: str | None = None
+    from_time: datetime | None = Field(default=None, alias="from")
+    to_time: datetime | None = Field(default=None, alias="to")
+    limit: int = Field(default=50, ge=1, le=100)
+    expires_at: datetime
+
+    @field_validator("dataset_id")
+    @classmethod
+    def dataset_non_blank(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("dataset_id 必须是非空字符串")
+        return value.strip()
+
+    @field_validator("request_id")
+    @classmethod
+    def request_id_non_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("request_id 必须是非空字符串")
+        return value.strip()
+
+    @field_validator("from_time", "to_time", "expires_at", mode="before")
+    @classmethod
+    def parse_time_with_timezone(cls, value: object, info) -> datetime | None:
+        if value is None:
+            return None
+        name = "from" if info.field_name == "from_time" else (
+            "to" if info.field_name == "to_time" else "expires_at"
+        )
+        return _parse_share_time(value, name)
 
 
 EXPORT_FIELDS = [
@@ -207,7 +259,10 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail="format 只能是 json 或 csv")
         if dataset_id is not None and dataset_id != DATASET_ID:
             raise HTTPException(status_code=422, detail=f"dataset_id 只能为 {DATASET_ID}")
-        if request_id is not None:
+        # An explicitly empty request_id= is a valid filter that matches
+        # nothing; only whitespace-only values are rejected.
+        empty_request_id = request_id == ""
+        if request_id is not None and not empty_request_id:
             request_id = request_id.strip()
             if not request_id:
                 raise HTTPException(status_code=422, detail="request_id 必须是非空字符串")
@@ -215,14 +270,17 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         end = _parse_export_time(to_time, "to") if to_time is not None else None
         if start is not None and end is not None and start >= end:
             raise HTTPException(status_code=422, detail="from 必须早于 to")
-        records = query_releases(
-            path,
-            dataset_id=dataset_id,
-            request_id=request_id,
-            start=start,
-            end=end,
-            limit=limit,
-        )
+        if empty_request_id:
+            records = []
+        else:
+            records = query_releases(
+                path,
+                dataset_id=dataset_id,
+                request_id=request_id,
+                start=start,
+                end=end,
+                limit=limit,
+            )
         if format == "json":
             return JSONResponse(
                 [ReleaseRecord(**record).model_dump() for record in records]
@@ -250,6 +308,73 @@ def create_app(database_path: Path | None = None) -> FastAPI:
                 "Content-Disposition": 'attachment; filename="releases-export.csv"'
             },
         )
+
+    def _share_payload(record: dict) -> dict:
+        return {
+            "share_id": record["share_id"],
+            "token": record["token"],
+            "dataset_id": record["dataset_id"],
+            "request_id": record["request_id"],
+            "from": record["from"],
+            "to": record["to"],
+            "limit": record["limit"],
+            "created_at": record["created_at"],
+            "expires_at": record["expires_at"],
+        }
+
+    @application.post("/api/shares", status_code=201)
+    def create_partner_share(request: ShareRequest) -> dict:
+        if request.dataset_id != DATASET_ID:
+            raise HTTPException(
+                status_code=422, detail=f"dataset_id 只能为 {DATASET_ID}"
+            )
+        if request.expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=422, detail="expires_at 必须在未来")
+        if (
+            request.from_time is not None
+            and request.to_time is not None
+            and request.from_time >= request.to_time
+        ):
+            raise HTTPException(status_code=422, detail="from 必须早于 to")
+        record = create_share(
+            path,
+            dataset_id=request.dataset_id,
+            request_id=request.request_id,
+            start=request.from_time,
+            end=request.to_time,
+            limit=request.limit,
+            expires_at=request.expires_at,
+        )
+        return _share_payload(record)
+
+    @application.get(
+        "/api/shares/{token}/releases", response_model=list[ReleaseRecord]
+    )
+    def shared_releases(token: str) -> list[dict]:
+        share = get_share_by_token(path, token)
+        if share is None:
+            raise HTTPException(status_code=404, detail="未知分享")
+        now = datetime.now(timezone.utc)
+        if share["revoked_at"] is not None:
+            raise HTTPException(status_code=410, detail="分享已撤销")
+        if datetime.fromisoformat(share["expires_at"]) <= now:
+            raise HTTPException(status_code=410, detail="分享已过期")
+        # Read-only view over the releases table: no budget is deducted, no
+        # release record is created, and member-level data is never read.
+        return query_releases(
+            path,
+            dataset_id=share["dataset_id"],
+            request_id=share["request_id"],
+            start=datetime.fromisoformat(share["from"]) if share["from"] else None,
+            end=datetime.fromisoformat(share["to"]) if share["to"] else None,
+            limit=share["limit"],
+        )
+
+    @application.delete("/api/shares/{token}", status_code=204)
+    def revoke_partner_share(token: str) -> Response:
+        if not revoke_share(path, token):
+            raise HTTPException(status_code=404, detail="未知分享")
+        return Response(status_code=204)
 
     return application
 
