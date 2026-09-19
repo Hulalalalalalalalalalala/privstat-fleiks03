@@ -385,9 +385,15 @@ class ShareAccessEventEndpointTests(unittest.TestCase):
         with running_demo(0) as base_url:
             publish(base_url, "audit-write-fails")
             share = create_share_http(base_url, request_id="audit-write-fails")
+            boom = RuntimeError("audit storage unavailable")
+            # The served path consumes quota and audits in one transaction
+            # via serve_share_access; rejection paths append through
+            # record_share_access_event. Either write failing must surface
+            # as 500 without leaking data or spending quota.
             with mock.patch(
-                "privstat.app.record_share_access_event",
-                side_effect=RuntimeError("audit storage unavailable"),
+                "privstat.app.serve_share_access", side_effect=boom
+            ), mock.patch(
+                "privstat.app.record_share_access_event", side_effect=boom
             ):
                 status, body = request(
                     base_url, "GET", f"/api/shares/{share['token']}/releases"
@@ -407,7 +413,7 @@ class ShareAccessEventEndpointTests(unittest.TestCase):
                 self.assertEqual(status, 500)
                 self.assertNotIn("分享已撤销", body)
             # Once storage works again, access behaves normally and the
-            # failed served attempt left no half-written event.
+            # failed served attempt left no half-written event or quota use.
             status, body = request(
                 base_url, "GET", f"/api/shares/{share['token']}/releases"
             )

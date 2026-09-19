@@ -64,6 +64,7 @@
     .outcome-expired { color: #8a6d1d; background: #faf3df; }
     .outcome-revoked { color: #8c3a3a; background: #f9ecec; }
     .outcome-superseded { color: #4a5a6a; background: #edf0f4; }
+    .outcome-quota_exhausted { color: #8c4a1d; background: #fbeee6; }
     #audit-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
     #audit-message.error { color: #9b2c2c; }
     #audit-message.success { color: #236345; }
@@ -175,13 +176,14 @@
     <section class="panel" aria-label="合作方分享">
       <div class="eyebrow">SHARE</div>
       <h2>合作方分享</h2>
-      <p class="intro">创建可撤销、可过期的只读链接，合作方仅能查看范围内已成功发布的记录；访问不消耗隐私预算，也不产生新的发布记录。</p>
+      <p class="intro">创建可撤销、可过期、可限定成功访问次数的只读链接，合作方仅能查看范围内已成功发布的记录；访问不消耗隐私预算，也不产生新的发布记录。访问次数用尽后链接返回 429，轮换凭证不重置已用次数。</p>
       <form id="share-form">
         <div class="form-grid">
           <label>请求标识 request_id（可选，精确匹配）<input id="share-request-id" placeholder="留空表示全部"></label>
           <label>起始时间 from（包含，可选）<input id="share-from" type="datetime-local" step="1"></label>
           <label>结束时间 to（不包含，可选）<input id="share-to" type="datetime-local" step="1"></label>
           <label>条数 limit（1–100）<input id="share-limit" type="number" min="1" max="100" value="50"></label>
+          <label>成功访问配额 max_accesses（1–1000，留空不限）<input id="share-max-accesses" type="number" min="1" max="1000" step="1" placeholder="留空表示不限次数"></label>
           <label>过期时间 expires_at（必填）<input id="share-expires" type="datetime-local" step="1" required></label>
         </div>
         <button type="submit" id="share-button">创建分享</button>
@@ -214,7 +216,7 @@
     <section class="panel" aria-label="访问审计">
       <div class="eyebrow">ACCESS AUDIT</div>
       <h2>合作方访问审计</h2>
-      <p class="intro">记录合作方通过分享链接访问发布记录的结果：成功（served）、已过期（expired）、已撤销（revoked）与旧令牌（superseded）。按访问时间倒序，仅含事件字段，不保存也不显示访问令牌或其摘要；查询本身不产生事件。</p>
+      <p class="intro">记录合作方通过分享链接访问发布记录的结果：成功（served）、已过期（expired）、已撤销（revoked）、旧令牌（superseded）与配额用尽（quota_exhausted）。按访问时间倒序，仅含事件字段，不保存也不显示访问令牌或其摘要；查询本身不产生事件。</p>
       <form id="audit-form">
         <div class="form-grid">
           <label>分享标识 share_id（可选，精确匹配）<input id="audit-share-id" placeholder="留空表示全部分享"></label>
@@ -225,6 +227,7 @@
               <option value="expired">expired（已过期）</option>
               <option value="revoked">revoked（已撤销）</option>
               <option value="superseded">superseded（旧令牌）</option>
+              <option value="quota_exhausted">quota_exhausted（配额用尽）</option>
             </select>
           </label>
           <label>起始时间 from（包含，可选）<input id="audit-from" type="datetime-local" step="1"></label>
@@ -603,6 +606,13 @@
       return parts.join(' · ');
     }
 
+    function describeQuota(share) {
+      if (share.max_accesses === null || share.max_accesses === undefined) {
+        return `已用 ${share.served_count ?? 0} · 剩余不限 · 配额不限`;
+      }
+      return `已用 ${share.served_count ?? 0} · 剩余 ${share.remaining_accesses} · 配额 ${share.max_accesses}`;
+    }
+
     async function copyShareLink(token, button) {
       const url = shareUrl(token);
       try {
@@ -730,6 +740,7 @@
         const details = document.createElement('dl');
         const items = [
           ['范围', describeShareScope(share)],
+          ['访问配额', describeQuota(share)],
           ['过期时间', new Date(share.expires_at).toLocaleString()],
           ['创建时间', new Date(share.created_at).toLocaleString()],
           ['share_id', share.share_id],
@@ -797,6 +808,16 @@
         return;
       }
       payload.limit = limit;
+      const maxAccessesRaw = document.getElementById('share-max-accesses').value.trim();
+      if (maxAccessesRaw !== '') {
+        const maxAccesses = Number(maxAccessesRaw);
+        if (!Number.isInteger(maxAccesses) || maxAccesses < 1 || maxAccesses > 1000) {
+          message.className = 'error';
+          message.textContent = '创建分享失败：max_accesses 必须是 1–1000 的整数，或留空表示不限次数。';
+          return;
+        }
+        payload.max_accesses = maxAccesses;
+      }
       const expiresIso = localInputToIso(document.getElementById('share-expires').value);
       if (!expiresIso) {
         message.className = 'error';
@@ -861,6 +882,23 @@
         }
         const shares = await response.json();
         container.textContent = '';
+        // Keep the session's copyable cards in sync with server-side
+        // quota counters (e.g. after a partner consumed an access).
+        let sessionCountersChanged = false;
+        for (const managed of shares) {
+          const sessionShare = createdShares.find(item => item.share_id === managed.share_id);
+          if (sessionShare && (
+            sessionShare.served_count !== managed.served_count
+            || sessionShare.remaining_accesses !== managed.remaining_accesses
+            || sessionShare.max_accesses !== managed.max_accesses
+          )) {
+            sessionShare.max_accesses = managed.max_accesses;
+            sessionShare.served_count = managed.served_count;
+            sessionShare.remaining_accesses = managed.remaining_accesses;
+            sessionCountersChanged = true;
+          }
+        }
+        if (sessionCountersChanged) renderShares();
         if (!shares.length) {
           const empty = document.createElement('p');
           empty.className = 'empty';
@@ -880,6 +918,7 @@
           const details = document.createElement('dl');
           const items = [
             ['范围', describeShareScope(share)],
+            ['访问配额', describeQuota(share)],
             ['过期时间', new Date(share.expires_at).toLocaleString()],
             ['创建时间', new Date(share.created_at).toLocaleString()],
             ['撤销时间', share.revoked_at ? new Date(share.revoked_at).toLocaleString() : '—'],
@@ -963,6 +1002,7 @@
       expired: { label: 'expired · 已过期', className: 'outcome-expired' },
       revoked: { label: 'revoked · 已撤销', className: 'outcome-revoked' },
       superseded: { label: 'superseded · 旧令牌', className: 'outcome-superseded' },
+      quota_exhausted: { label: 'quota_exhausted · 配额用尽', className: 'outcome-quota_exhausted' },
     };
     const AUDIT_FIELDS = ['event_id', 'share_id', 'token_version', 'outcome', 'result_count', 'accessed_at'];
 

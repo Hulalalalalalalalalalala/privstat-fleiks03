@@ -58,12 +58,12 @@ _SHARES_COLUMNS_SQL = (
     "dataset_id TEXT NOT NULL, request_id TEXT, "
     "from_time TEXT, to_time TEXT, result_limit INTEGER NOT NULL, "
     "created_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
-    "revoked_at TEXT)"
+    "revoked_at TEXT, max_accesses INTEGER, served_count INTEGER NOT NULL DEFAULT 0)"
 )
 
 _SHARES_INSERT_COLUMNS = (
     "share_id, token_digest, dataset_id, request_id, from_time, to_time, "
-    "result_limit, created_at, expires_at, revoked_at"
+    "result_limit, created_at, expires_at, revoked_at, max_accesses, served_count"
 )
 
 # One row per token generation: generation 1 is the original token from
@@ -110,7 +110,7 @@ def _migrate_legacy_shares(connection: sqlite3.Connection) -> None:
     connection.execute(_SHARES_COLUMNS_SQL)
     connection.executemany(
         f"INSERT INTO shares ({_SHARES_INSERT_COLUMNS}) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)",
         [
             (
                 share_id,
@@ -139,6 +139,25 @@ def _migrate_legacy_shares(connection: sqlite3.Connection) -> None:
         ],
     )
     connection.execute("DROP TABLE shares_legacy_plaintext")
+
+
+def _migrate_share_quota_columns(connection: sqlite3.Connection) -> None:
+    """Backfill the access-quota columns on a pre-quota shares table.
+
+    Existing shares mean "unlimited accesses, zero used so far":
+    max_accesses is NULL and served_count is 0. Runs inside the caller's
+    transaction and is idempotent: databases already carrying the columns
+    are never altered.
+    """
+    columns = _table_columns(connection, "shares")
+    if "max_accesses" not in columns:
+        # No default: NULL marks an unlimited share.
+        connection.execute("ALTER TABLE shares ADD COLUMN max_accesses INTEGER")
+    if "served_count" not in columns:
+        # ADD COLUMN ... DEFAULT backfills every existing row to 0.
+        connection.execute(
+            "ALTER TABLE shares ADD COLUMN served_count INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _backfill_release_timestamps(connection: sqlite3.Connection) -> None:
@@ -222,6 +241,10 @@ def initialize_database(path: Path) -> None:
             elif "token_digest" not in share_columns:
                 _migrate_legacy_shares(connection)
                 migrated_plaintext = True
+            # Pre-quota databases gain the quota columns here; every
+            # existing share is backfilled to unlimited / zero used, while
+            # its scope, token generations and revoked state are untouched.
+            _migrate_share_quota_columns(connection)
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_shares_created_at "
                 "ON shares (created_at DESC)"
@@ -646,6 +669,38 @@ def _share_from_row(row: sqlite3.Row) -> dict:
         "created_at": row["created_at"],
         "expires_at": row["expires_at"],
         "revoked_at": row["revoked_at"],
+        # NULL max_accesses means unlimited; remaining is derived by callers.
+        "max_accesses": row["max_accesses"],
+        "served_count": row["served_count"],
+    }
+
+
+def _remaining_accesses(max_accesses: int | None, served_count: int) -> int | None:
+    if max_accesses is None:
+        return None
+    return max(0, max_accesses - served_count)
+
+
+def _share_managed_record(share: dict, *, now_iso: str) -> dict:
+    """Token-free management view of one share, including quota counters."""
+    return {
+        "share_id": share["share_id"],
+        "dataset_id": share["dataset_id"],
+        "request_id": share["request_id"],
+        "from": share["from"],
+        "to": share["to"],
+        "limit": share["limit"],
+        "created_at": share["created_at"],
+        "expires_at": share["expires_at"],
+        "revoked_at": share["revoked_at"],
+        "max_accesses": share["max_accesses"],
+        "served_count": share["served_count"],
+        "remaining_accesses": _remaining_accesses(
+            share["max_accesses"], share["served_count"]
+        ),
+        "status": _share_status(
+            share["expires_at"], share["revoked_at"], now_iso
+        ),
     }
 
 
@@ -658,12 +713,15 @@ def create_share(
     end: datetime | None,
     limit: int,
     expires_at: datetime,
+    max_accesses: int | None = None,
 ) -> dict:
     """Persist a share scope and return the stored record.
 
     The raw token is an unguessable random string returned to the caller
     exactly once; only its SHA-256 digest is stored. No token or digest
-    ever appears in release history or exports.
+    ever appears in release history or exports. ``max_accesses`` is the
+    successful-access quota; None means unlimited. served_count starts at
+    0 and is only advanced atomically by a served share access.
     """
     token = secrets.token_urlsafe(32)
     record = {
@@ -677,11 +735,13 @@ def create_share(
         "created_at": _utc_iso(datetime.now(timezone.utc)),
         "expires_at": _utc_iso(expires_at),
         "revoked_at": None,
+        "max_accesses": max_accesses,
+        "served_count": 0,
     }
     with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute(
             f"INSERT INTO shares ({_SHARES_INSERT_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 record["share_id"],
                 hash_token(token),
@@ -693,6 +753,8 @@ def create_share(
                 record["created_at"],
                 record["expires_at"],
                 record["revoked_at"],
+                record["max_accesses"],
+                record["served_count"],
             ),
         )
         # The original token is generation 1 of the share.
@@ -933,27 +995,17 @@ def list_shares(
     now_iso = _utc_iso(now)
     records: list[dict] = []
     for row in rows:
-        share = _share_from_row(row)
-        records.append(
-            {
-                "share_id": share["share_id"],
-                "dataset_id": share["dataset_id"],
-                "request_id": share["request_id"],
-                "from": share["from"],
-                "to": share["to"],
-                "limit": share["limit"],
-                "created_at": share["created_at"],
-                "expires_at": share["expires_at"],
-                "revoked_at": share["revoked_at"],
-                "status": _share_status(
-                    share["expires_at"], share["revoked_at"], now_iso
-                ),
-            }
-        )
+        records.append(_share_managed_record(_share_from_row(row), now_iso=now_iso))
     return records
 
 
-SHARE_ACCESS_OUTCOMES = ("served", "expired", "revoked", "superseded")
+SHARE_ACCESS_OUTCOMES = (
+    "served",
+    "expired",
+    "revoked",
+    "superseded",
+    "quota_exhausted",
+)
 
 
 def _access_event_from_row(row: sqlite3.Row) -> dict:
@@ -1016,6 +1068,79 @@ def record_share_access_event(
                 connection.execute("ROLLBACK")
             raise
     return record
+
+
+def serve_share_access(
+    path: Path,
+    *,
+    share_id: str,
+    token_version: int,
+    result_count: int,
+) -> dict:
+    """Atomically consume one successful access and append its audit row.
+
+    The served_count increment and the ``served`` event insert happen in a
+    single BEGIN IMMEDIATE transaction: the quota is re-checked under the
+    write lock after reading the current counter, so concurrent accesses to
+    a finite-quota share can produce at most ``max_accesses`` served
+    outcomes — every loser finds the quota full inside the transaction and
+    instead appends a ``quota_exhausted`` event (result_count 0) without
+    incrementing anything. Unlimited shares (max_accesses NULL) always
+    take the served branch.
+
+    On any failure the whole transaction rolls back: no counter moves, no
+    event is appended, and the caller must answer 500 without returning the
+    resolved records. Returns the stored event record; inspect its
+    ``outcome`` to tell served from quota_exhausted.
+    """
+    accessed_at = _utc_iso(datetime.now(timezone.utc))
+    with closing(sqlite3.connect(path)) as connection:
+        connection.isolation_level = None
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT max_accesses, served_count FROM shares "
+                "WHERE share_id = ?",
+                (share_id,),
+            ).fetchone()
+            max_accesses, served_count = row
+            exhausted = (
+                max_accesses is not None and served_count >= max_accesses
+            )
+            outcome = "quota_exhausted" if exhausted else "served"
+            event = {
+                "event_id": uuid.uuid4().hex,
+                "share_id": share_id,
+                "token_version": token_version,
+                "outcome": outcome,
+                "result_count": 0 if exhausted else result_count,
+                "accessed_at": accessed_at,
+            }
+            if not exhausted:
+                connection.execute(
+                    "UPDATE shares SET served_count = served_count + 1 "
+                    "WHERE share_id = ?",
+                    (share_id,),
+                )
+            connection.execute(
+                "INSERT INTO share_access_events "
+                "(event_id, share_id, token_version, outcome, result_count, "
+                "accessed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    event["event_id"],
+                    event["share_id"],
+                    event["token_version"],
+                    event["outcome"],
+                    event["result_count"],
+                    event["accessed_at"],
+                ),
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+    return event
 
 
 def list_share_access_events(

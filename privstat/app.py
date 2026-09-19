@@ -47,6 +47,7 @@ from .database import (
     revoke_share,
     revoke_share_by_id,
     rotate_share,
+    serve_share_access,
 )
 
 
@@ -188,6 +189,10 @@ class ShareRequest(BaseModel):
     to_time: datetime | None = Field(default=None, alias="to")
     limit: int = Field(default=50, ge=1, le=100)
     expires_at: datetime
+    # Omitted or null = unlimited successful accesses; otherwise an
+    # integer in 1..1000. Anything else (0, 1001, non-integer text) is a
+    # 422 through Pydantic's standard type/range validation.
+    max_accesses: int | None = Field(default=None, ge=1, le=1000)
 
     @field_validator("dataset_id")
     @classmethod
@@ -483,6 +488,13 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             "limit": record["limit"],
             "created_at": record["created_at"],
             "expires_at": record["expires_at"],
+            "max_accesses": record["max_accesses"],
+            "served_count": record["served_count"],
+            "remaining_accesses": (
+                None
+                if record["max_accesses"] is None
+                else record["max_accesses"] - record["served_count"]
+            ),
         }
 
     @application.post("/api/shares", status_code=201)
@@ -507,6 +519,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             end=request.to_time,
             limit=request.limit,
             expires_at=request.expires_at,
+            max_accesses=request.max_accesses,
         )
         return _share_payload(record)
 
@@ -555,7 +568,8 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="未知分享")
         now = datetime.now(timezone.utc)
         # Revocation takes precedence over expiry, which takes precedence
-        # over a superseded token generation.
+        # over a superseded token generation; the successful-access quota
+        # is judged last, only for otherwise-valid current tokens.
         if share["revoked_at"] is not None:
             outcome = "revoked"
         elif datetime.fromisoformat(share["expires_at"]) <= now:
@@ -567,7 +581,8 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         if outcome is not None:
             # The rejection is audited before the response is produced: if
             # the audit write fails, the error propagates and no share data
-            # goes out. A rejection never carries release rows.
+            # goes out. A rejection never carries release rows and never
+            # consumes quota.
             record_share_access_event(
                 path,
                 share_id=share["share_id"],
@@ -591,15 +606,21 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             end=datetime.fromisoformat(share["to"]) if share["to"] else None,
             limit=share["limit"],
         )
-        # Audit first, return second: a failed audit write raises and the
-        # resolved share data never leaves the server.
-        record_share_access_event(
+        # Counter and audit move in one SQLite transaction: the quota is
+        # re-checked under the write lock, so concurrent accesses can win
+        # exactly max_accesses times and every later attempt lands here as
+        # a 429 with a quota_exhausted event — the queried records are then
+        # dropped, so an exhausted link leaks no rows. A write failure
+        # rolls the transaction back (no quota spent, no event) and the
+        # raised error suppresses the response.
+        event = serve_share_access(
             path,
             share_id=share["share_id"],
             token_version=share["token_version"],
-            outcome="served",
             result_count=len(records),
         )
+        if event["outcome"] == "quota_exhausted":
+            raise HTTPException(status_code=429, detail="分享访问次数已用尽")
         return records
 
     @application.get(
@@ -617,7 +638,10 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         if outcome is not None and outcome not in SHARE_ACCESS_OUTCOMES:
             raise HTTPException(
                 status_code=422,
-                detail="outcome 只能是 served、expired、revoked 或 superseded",
+                detail=(
+                    "outcome 只能是 served、expired、revoked、superseded "
+                    "或 quota_exhausted"
+                ),
             )
         if share_id is not None:
             share_id = share_id.strip()

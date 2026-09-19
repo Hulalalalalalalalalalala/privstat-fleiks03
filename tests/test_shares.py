@@ -86,6 +86,9 @@ class ShareCreateTests(unittest.TestCase):
                     "limit",
                     "created_at",
                     "expires_at",
+                    "max_accesses",
+                    "served_count",
+                    "remaining_accesses",
                 },
             )
             self.assertGreaterEqual(len(share["token"]), 32)
@@ -95,6 +98,10 @@ class ShareCreateTests(unittest.TestCase):
             self.assertEqual(share["from"], "2026-01-01T00:00:00.000000+00:00")
             self.assertEqual(share["to"], "2027-01-01T00:00:00.000000+00:00")
             self.assertEqual(share["limit"], 10)
+            # No max_accesses was given: unlimited, zero used, null remaining.
+            self.assertIsNone(share["max_accesses"])
+            self.assertEqual(share["served_count"], 0)
+            self.assertIsNone(share["remaining_accesses"])
             # Tokens are unique and unguessable between shares.
             status, other = create_share(base_url)
             self.assertEqual(status, 201)
@@ -126,6 +133,11 @@ class ShareCreateTests(unittest.TestCase):
                 {"limit": 0},
                 {"limit": 101},
                 {"limit": "abc"},
+                {"max_accesses": 0},
+                {"max_accesses": -1},
+                {"max_accesses": 1001},
+                {"max_accesses": "abc"},
+                {"max_accesses": 1.5},
                 {
                     "from": "2026-06-01T00:00:00Z",
                     "to": "2026-06-01T00:00:00Z",
