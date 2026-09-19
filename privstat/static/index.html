@@ -151,7 +151,7 @@
     <section class="panel" aria-label="分享管理">
       <div class="eyebrow">SHARE MANAGEMENT</div>
       <h2>分享管理</h2>
-      <p class="intro">列出服务端保存的全部分享，按当前 UTC 时间计算状态；列表不包含访问令牌。可按状态筛选，并按 share_id 撤销，撤销在提交后立即生效。</p>
+      <p class="intro">列出服务端保存的全部分享，按当前 UTC 时间计算状态；列表不包含访问令牌。可按状态筛选、轮换凭证或按 share_id 撤销，操作在提交后立即生效；轮换后的新链接仅显示一次。</p>
       <div class="share-actions" style="margin: 12px 0 18px;">
         <label style="flex:0 1 240px; min-width:200px;">状态筛选
           <select id="share-status-filter">
@@ -164,6 +164,7 @@
         <button type="button" class="secondary" id="share-refresh-button">刷新列表</button>
       </div>
       <div id="managed-message" role="status" aria-live="polite"></div>
+      <div id="rotation-result"></div>
       <div id="managed-shares"></div>
     </section>
 
@@ -469,6 +470,113 @@
       }
     }
 
+    function newRotationId() {
+      const suffix = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
+      return `rot-${suffix}`;
+    }
+
+    async function rotateShare(shareId) {
+      const response = await fetch(`/api/shares/id/${encodeURIComponent(shareId)}/rotate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rotation_id: newRotationId() }),
+      });
+      const data = await response.json().catch(() => null);
+      return { status: response.status, data };
+    }
+
+    function showRotatedLink(container, token) {
+      container.textContent = '';
+      const card = document.createElement('article');
+      card.className = 'release-card';
+      const title = document.createElement('h3');
+      title.textContent = '新分享链接（仅显示一次，请立即复制）';
+      const actions = document.createElement('div');
+      actions.className = 'share-actions';
+      const input = document.createElement('input');
+      input.readOnly = true;
+      input.value = shareUrl(token);
+      input.addEventListener('focus', () => input.select());
+      const copyButton = document.createElement('button');
+      copyButton.type = 'button';
+      copyButton.className = 'secondary';
+      copyButton.textContent = '复制链接';
+      copyButton.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(input.value);
+          copyButton.textContent = '已复制';
+        } catch (_) {
+          input.focus();
+          input.select();
+          document.execCommand('copy');
+          copyButton.textContent = '已复制';
+        }
+        setTimeout(() => { copyButton.textContent = '复制链接'; }, 2000);
+      });
+      actions.append(input, copyButton);
+      card.append(title, actions);
+      container.append(card);
+    }
+
+    async function rotateSessionShare(share, button) {
+      const message = document.getElementById('share-message');
+      message.className = '';
+      message.textContent = '';
+      button.disabled = true;
+      try {
+        const { status, data } = await rotateShare(share.share_id);
+        if (status === 201) {
+          share.token = data.token;
+          share.token_version = data.token_version;
+          renderShares();
+          message.className = 'success';
+          message.textContent = `凭证已轮换为第 ${data.token_version} 代，旧链接立即失效；新链接仅显示在下方卡片中，请立即复制保存。`;
+          return;
+        }
+        if (status === 200) {
+          message.textContent = '该轮换请求已处理过，令牌不会再次显示；如需新凭证请重新轮换。';
+          return;
+        }
+        message.className = 'error';
+        message.textContent = `轮换失败：${formatError(data, status)}`;
+      } catch (error) {
+        message.className = 'error';
+        message.textContent = `轮换失败：${error.message}`;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function rotateManagedShare(share, button) {
+      const message = document.getElementById('managed-message');
+      const resultBox = document.getElementById('rotation-result');
+      message.className = '';
+      message.textContent = '';
+      resultBox.textContent = '';
+      button.disabled = true;
+      try {
+        const { status, data } = await rotateShare(share.share_id);
+        if (status === 201) {
+          message.className = 'success';
+          message.textContent = `分享 ${share.share_id} 的凭证已轮换为第 ${data.token_version} 代，旧链接立即失效。`;
+          showRotatedLink(resultBox, data.token);
+          await loadManagedShares();
+          return;
+        }
+        if (status === 200) {
+          message.textContent = '该轮换请求已处理过，令牌不会再次显示；如需新凭证请重新轮换。';
+          return;
+        }
+        message.className = 'error';
+        message.textContent = `轮换失败：${formatError(data, status)}`;
+      } catch (error) {
+        message.className = 'error';
+        message.textContent = `轮换失败：${error.message}`;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
     function renderShares() {
       const container = document.getElementById('shares');
       container.textContent = '';
@@ -487,6 +595,7 @@
           ['范围', describeShareScope(share)],
           ['过期时间', new Date(share.expires_at).toLocaleString()],
           ['创建时间', new Date(share.created_at).toLocaleString()],
+          ['凭证代次', `第 ${share.token_version || 1} 代`],
           ['share_id', share.share_id],
         ];
         for (const [label, value] of items) {
@@ -508,13 +617,19 @@
         copyButton.className = 'secondary';
         copyButton.textContent = '复制链接';
         copyButton.addEventListener('click', () => copyShareLink(share.token, copyButton));
+        const rotateButton = document.createElement('button');
+        rotateButton.type = 'button';
+        rotateButton.className = 'secondary';
+        rotateButton.textContent = '轮换凭证';
+        rotateButton.disabled = share.revoked || status.label === '已过期';
+        rotateButton.addEventListener('click', () => rotateSessionShare(share, rotateButton));
         const revokeButton = document.createElement('button');
         revokeButton.type = 'button';
         revokeButton.className = 'danger';
         revokeButton.textContent = '撤销';
         revokeButton.disabled = share.revoked || status.label === '已过期';
         revokeButton.addEventListener('click', () => revokeShare(share.share_id));
-        actions.append(linkInput, copyButton, revokeButton);
+        actions.append(linkInput, copyButton, rotateButton, revokeButton);
         card.append(title, details, actions);
         container.append(card);
       }
@@ -635,6 +750,12 @@
           }
           const actions = document.createElement('div');
           actions.className = 'share-actions';
+          const rotateButton = document.createElement('button');
+          rotateButton.type = 'button';
+          rotateButton.className = 'secondary';
+          rotateButton.textContent = '轮换凭证';
+          rotateButton.disabled = share.status !== 'active';
+          rotateButton.addEventListener('click', () => rotateManagedShare(share, rotateButton));
           const revokeButton = document.createElement('button');
           revokeButton.type = 'button';
           revokeButton.className = 'danger';
@@ -646,7 +767,7 @@
             if (ok) await loadManagedShares();
             else revokeButton.disabled = false;
           });
-          actions.append(revokeButton);
+          actions.append(rotateButton, revokeButton);
           card.append(title, details, actions);
           container.append(card);
         }

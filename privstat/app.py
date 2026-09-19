@@ -22,6 +22,7 @@ from .database import (
     ROOT,
     BudgetExceededError,
     ReleaseConflictError,
+    ShareRotationConflictError,
     budget_status,
     canonical_filters,
     count_matching_members,
@@ -29,12 +30,14 @@ from .database import (
     create_share,
     get_share_by_token,
     initialize_database,
+    is_superseded_token,
     list_datasets,
     list_releases,
     list_shares,
     query_releases,
     revoke_share,
     revoke_share_by_id,
+    rotate_share,
 )
 
 
@@ -134,6 +137,17 @@ class ShareRequest(BaseModel):
             "to" if info.field_name == "to_time" else "expires_at"
         )
         return _parse_share_time(value, name)
+
+
+class RotateRequest(BaseModel):
+    rotation_id: str
+
+    @field_validator("rotation_id")
+    @classmethod
+    def rotation_id_non_blank(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("rotation_id 必须是非空字符串")
+        return value.strip()
 
 
 EXPORT_FIELDS = [
@@ -389,6 +403,10 @@ def create_app(database_path: Path | None = None) -> FastAPI:
     def shared_releases(token: str) -> list[dict]:
         share = get_share_by_token(path, token)
         if share is None:
+            if is_superseded_token(path, token):
+                raise HTTPException(
+                    status_code=410, detail="分享凭证已轮换，请使用最新链接"
+                )
             raise HTTPException(status_code=404, detail="未知分享")
         now = datetime.now(timezone.utc)
         if share["revoked_at"] is not None:
@@ -405,6 +423,29 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             end=datetime.fromisoformat(share["to"]) if share["to"] else None,
             limit=share["limit"],
         )
+
+    @application.post("/api/shares/id/{share_id}/rotate", status_code=201)
+    def rotate_partner_share(
+        share_id: str, request: RotateRequest, response: Response
+    ) -> dict:
+        # Rotation only rewrites the share's own credential: it never
+        # reads member data, never deducts budget, and never creates
+        # release records. The new plaintext token is returned only in
+        # the 201 response of the call that created it.
+        try:
+            result = rotate_share(
+                path, share_id=share_id, rotation_id=request.rotation_id
+            )
+        except ShareRotationConflictError:
+            raise HTTPException(
+                status_code=409, detail="分享已撤销或已过期，无法轮换凭证"
+            ) from None
+        if result is None:
+            raise HTTPException(status_code=404, detail="未知分享")
+        record, created = result
+        if not created:
+            response.status_code = 200
+        return record
 
     @application.delete("/api/shares/id/{share_id}", status_code=204)
     def revoke_partner_share_by_id(share_id: str) -> Response:
