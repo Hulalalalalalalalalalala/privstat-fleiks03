@@ -26,6 +26,7 @@ from .database import (
     DEFAULT_EPSILON_BUDGET,
     PUBLIC_FILTER_FIELDS,
     ROOT,
+    SHARE_ACCESS_OUTCOMES,
     BatchConflictError,
     BudgetExceededError,
     ReleaseConflictError,
@@ -39,8 +40,10 @@ from .database import (
     initialize_database,
     list_datasets,
     list_releases,
+    list_share_access_events,
     list_shares,
     query_releases,
+    record_share_access_event,
     revoke_share,
     revoke_share_by_id,
     rotate_share,
@@ -153,6 +156,17 @@ class PrivacyBudget(BaseModel):
     remaining_budget: float
 
 
+class ShareAccessEventRecord(BaseModel):
+    # The audit trail exposes these six fields and nothing else: no raw
+    # token and no token digest ever leaves the server.
+    event_id: str
+    share_id: str
+    token_version: int
+    outcome: str
+    result_count: int
+    accessed_at: str
+
+
 def _parse_share_time(raw: object, name: str) -> datetime:
     if not isinstance(raw, str):
         raise ValueError(f"{name} 必须是 ISO-8601 时间字符串，例如 2026-01-01T00:00:00Z")
@@ -223,6 +237,24 @@ def _parse_export_time(raw: str, name: str) -> datetime:
         ) from None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_access_event_time(raw: str, name: str) -> datetime:
+    # Audit windows always require an explicit timezone: unlike exports, a
+    # bare timestamp is ambiguous and rejected rather than assumed UTC.
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{name} 必须是带时区的 ISO-8601 时间，例如 2026-01-01T00:00:00Z",
+        ) from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{name} 必须包含时区，例如 2026-01-01T00:00:00Z",
+        )
     return parsed.astimezone(timezone.utc)
 
 
@@ -518,23 +550,93 @@ def create_app(database_path: Path | None = None) -> FastAPI:
     def shared_releases(token: str) -> list[dict]:
         share = get_share_by_token(path, token)
         if share is None:
+            # Unknown tokens are unresolvable, so they are neither audited
+            # nor distinguishable from a typo.
             raise HTTPException(status_code=404, detail="未知分享")
         now = datetime.now(timezone.utc)
+        # Revocation takes precedence over expiry, which takes precedence
+        # over a superseded token generation.
         if share["revoked_at"] is not None:
-            raise HTTPException(status_code=410, detail="分享已撤销")
-        if datetime.fromisoformat(share["expires_at"]) <= now:
-            raise HTTPException(status_code=410, detail="分享已过期")
-        if not share["token_current"]:
-            raise HTTPException(status_code=410, detail="分享凭证已轮换，旧令牌已失效")
+            outcome = "revoked"
+        elif datetime.fromisoformat(share["expires_at"]) <= now:
+            outcome = "expired"
+        elif not share["token_current"]:
+            outcome = "superseded"
+        else:
+            outcome = None
+        if outcome is not None:
+            # The rejection is audited before the response is produced: if
+            # the audit write fails, the error propagates and no share data
+            # goes out. A rejection never carries release rows.
+            record_share_access_event(
+                path,
+                share_id=share["share_id"],
+                token_version=share["token_version"],
+                outcome=outcome,
+                result_count=0,
+            )
+            detail = {
+                "revoked": "分享已撤销",
+                "expired": "分享已过期",
+                "superseded": "分享凭证已轮换，旧令牌已失效",
+            }[outcome]
+            raise HTTPException(status_code=410, detail=detail)
         # Read-only view over the releases table: no budget is deducted, no
         # release record is created, and member-level data is never read.
-        return query_releases(
+        records = query_releases(
             path,
             dataset_id=share["dataset_id"],
             request_id=share["request_id"],
             start=datetime.fromisoformat(share["from"]) if share["from"] else None,
             end=datetime.fromisoformat(share["to"]) if share["to"] else None,
             limit=share["limit"],
+        )
+        # Audit first, return second: a failed audit write raises and the
+        # resolved share data never leaves the server.
+        record_share_access_event(
+            path,
+            share_id=share["share_id"],
+            token_version=share["token_version"],
+            outcome="served",
+            result_count=len(records),
+        )
+        return records
+
+    @application.get(
+        "/api/share-access-events", response_model=list[ShareAccessEventRecord]
+    )
+    def share_access_events(
+        share_id: str | None = Query(default=None),
+        outcome: str | None = Query(default=None),
+        from_time: str | None = Query(default=None, alias="from"),
+        to_time: str | None = Query(default=None, alias="to"),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> list[dict]:
+        # Validation mirrors the export endpoint: bad outcome/time/limit or
+        # a non-half-open window is a 422 instead of an empty result.
+        if outcome is not None and outcome not in SHARE_ACCESS_OUTCOMES:
+            raise HTTPException(
+                status_code=422,
+                detail="outcome 只能是 served、expired、revoked 或 superseded",
+            )
+        if share_id is not None:
+            share_id = share_id.strip()
+            if not share_id:
+                raise HTTPException(
+                    status_code=422, detail="share_id 必须是非空字符串"
+                )
+        start = _parse_access_event_time(from_time, "from") if from_time is not None else None
+        end = _parse_access_event_time(to_time, "to") if to_time is not None else None
+        if start is not None and end is not None and start >= end:
+            raise HTTPException(status_code=422, detail="from 必须早于 to")
+        # Querying the audit trail is itself read-only and never audited.
+        return list_share_access_events(
+            path,
+            share_id=share_id,
+            outcome=outcome,
+            start=start,
+            end=end,
+            limit=limit,
         )
 
     @application.post("/api/shares/id/{share_id}/rotate", status_code=201)
