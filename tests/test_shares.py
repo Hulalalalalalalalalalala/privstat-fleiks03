@@ -211,14 +211,17 @@ class ShareAccessTests(unittest.TestCase):
             self.assertEqual(budget_before, budget_after)
             self.assertEqual(history_before, history_after)
 
-    def test_unknown_token_returns_404(self):
+    def test_unknown_token_access_returns_404_but_revoke_is_204(self):
         with running_demo(0) as base_url:
             status, _ = request(
                 base_url, "GET", "/api/shares/no-such-token/releases"
             )
             self.assertEqual(status, 404)
-            status, _ = request(base_url, "DELETE", "/api/shares/no-such-token")
-            self.assertEqual(status, 404)
+            # Revocation by token is unconditionally idempotent, so an
+            # unknown token cannot be probed through the DELETE response.
+            status, body = request(base_url, "DELETE", "/api/shares/no-such-token")
+            self.assertEqual(status, 204)
+            self.assertEqual(body, "")
 
     def test_expired_share_returns_410(self):
         with running_demo(0) as base_url:

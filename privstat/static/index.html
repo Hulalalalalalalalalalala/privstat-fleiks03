@@ -144,7 +144,27 @@
         <button type="submit" id="share-button">创建分享</button>
       </form>
       <div id="share-message" role="status" aria-live="polite"></div>
+      <h3 style="margin:20px 0 8px;font-size:15px;">本次会话创建的链接（可复制）</h3>
       <div id="shares"></div>
+    </section>
+
+    <section class="panel" aria-label="分享管理">
+      <div class="eyebrow">SHARE MANAGEMENT</div>
+      <h2>分享管理</h2>
+      <p class="intro">列出服务端保存的全部分享，按当前 UTC 时间计算状态；列表不包含访问令牌。可按状态筛选，并按 share_id 撤销，撤销在提交后立即生效。</p>
+      <div class="share-actions" style="margin: 12px 0 18px;">
+        <label style="flex:0 1 240px; min-width:200px;">状态筛选
+          <select id="share-status-filter">
+            <option value="">全部状态</option>
+            <option value="active">有效</option>
+            <option value="expired">已过期</option>
+            <option value="revoked">已撤销</option>
+          </select>
+        </label>
+        <button type="button" class="secondary" id="share-refresh-button">刷新列表</button>
+      </div>
+      <div id="managed-message" role="status" aria-live="polite"></div>
+      <div id="managed-shares"></div>
     </section>
 
     <footer>当前使用合成零售样例，不包含真实客户数据。</footer>
@@ -426,24 +446,26 @@
       setTimeout(() => { button.textContent = '复制链接'; }, 2000);
     }
 
-    async function revokeShare(token) {
-      const share = createdShares.find(item => item.token === token);
+    async function revokeShare(shareId) {
       const message = document.getElementById('share-message');
       try {
-        const response = await fetch(`/api/shares/${token}`, { method: 'DELETE' });
+        const response = await fetch(`/api/shares/id/${encodeURIComponent(shareId)}`, { method: 'DELETE' });
         if (!response.ok && response.status !== 204) {
           const data = await response.json().catch(() => null);
           message.className = 'error';
           message.textContent = `撤销失败：${formatError(data, response.status)}`;
-          return;
+          return false;
         }
+        const share = createdShares.find(item => item.share_id === shareId);
         if (share) share.revoked = true;
         message.className = 'success';
         message.textContent = '分享已撤销，链接立即失效。';
         renderShares();
+        return true;
       } catch (error) {
         message.className = 'error';
         message.textContent = `撤销失败：${error.message}`;
+        return false;
       }
     }
 
@@ -491,15 +513,14 @@
         revokeButton.className = 'danger';
         revokeButton.textContent = '撤销';
         revokeButton.disabled = share.revoked || status.label === '已过期';
-        revokeButton.addEventListener('click', () => revokeShare(share.token));
+        revokeButton.addEventListener('click', () => revokeShare(share.share_id));
         actions.append(linkInput, copyButton, revokeButton);
         card.append(title, details, actions);
         container.append(card);
       }
     }
 
-    document.getElementById('share-form').addEventListener('submit', async (event) => {
-      event.preventDefault();
+    document.getElementById('share-form').addEventListener('submit', async (event) => {      event.preventDefault();
       const message = document.getElementById('share-message');
       const button = document.getElementById('share-button');
       const payload = { dataset_id: 'retail-demo' };
@@ -546,6 +567,7 @@
         }
         createdShares.unshift({ ...data, revoked: false });
         renderShares();
+        await loadManagedShares();
         message.className = 'success';
         message.textContent = '分享已创建，复制链接发送给合作方；链接到期或撤销后自动失效。';
       } catch (error) {
@@ -556,7 +578,117 @@
       }
     });
 
-    setInterval(renderShares, 30000);
+    const STATUS_LABELS = {
+      active: { label: '有效', className: 'status-active' },
+      expired: { label: '已过期', className: 'status-expired' },
+      revoked: { label: '已撤销', className: 'status-revoked' },
+    };
+
+    async function loadManagedShares() {
+      const container = document.getElementById('managed-shares');
+      const message = document.getElementById('managed-message');
+      const status = document.getElementById('share-status-filter').value;
+      const params = new URLSearchParams({ limit: '100' });
+      if (status) params.set('status', status);
+      message.className = '';
+      message.textContent = '';
+      try {
+        const response = await fetch(`/api/shares?${params.toString()}`);
+        if (!response.ok) {
+          const data = await response.json().catch(() => null);
+          message.className = 'error';
+          message.textContent = `分享列表加载失败：${formatError(data, response.status)}`;
+          return;
+        }
+        const shares = await response.json();
+        container.textContent = '';
+        if (!shares.length) {
+          const empty = document.createElement('p');
+          empty.className = 'empty';
+          empty.textContent = '没有符合条件的分享。';
+          container.append(empty);
+          return;
+        }
+        for (const share of shares) {
+          const badge2 = STATUS_LABELS[share.status] || STATUS_LABELS.active;
+          const card = document.createElement('article');
+          card.className = 'release-card';
+          const title = document.createElement('h3');
+          const badge = document.createElement('span');
+          badge.className = `status-badge ${badge2.className}`;
+          badge.textContent = badge2.label;
+          title.append('分享 ', badge);
+          const details = document.createElement('dl');
+          const items = [
+            ['范围', describeShareScope(share)],
+            ['过期时间', new Date(share.expires_at).toLocaleString()],
+            ['创建时间', new Date(share.created_at).toLocaleString()],
+            ['撤销时间', share.revoked_at ? new Date(share.revoked_at).toLocaleString() : '—'],
+            ['share_id', share.share_id],
+          ];
+          for (const [label, value] of items) {
+            const dt = document.createElement('dt');
+            dt.textContent = label;
+            const dd = document.createElement('dd');
+            dd.textContent = value;
+            details.append(dt, dd);
+          }
+          const actions = document.createElement('div');
+          actions.className = 'share-actions';
+          const revokeButton = document.createElement('button');
+          revokeButton.type = 'button';
+          revokeButton.className = 'danger';
+          revokeButton.textContent = '按 share_id 撤销';
+          revokeButton.disabled = share.status === 'revoked';
+          revokeButton.addEventListener('click', async () => {
+            revokeButton.disabled = true;
+            const ok = await revokeManagedShare(share.share_id);
+            if (ok) await loadManagedShares();
+            else revokeButton.disabled = false;
+          });
+          actions.append(revokeButton);
+          card.append(title, details, actions);
+          container.append(card);
+        }
+      } catch (error) {
+        message.className = 'error';
+        message.textContent = `分享列表加载失败：${error.message}`;
+      }
+    }
+
+    async function revokeManagedShare(shareId) {
+      const message = document.getElementById('managed-message');
+      try {
+        const response = await fetch(`/api/shares/id/${encodeURIComponent(shareId)}`, { method: 'DELETE' });
+        if (!response.ok && response.status !== 204) {
+          const data = await response.json().catch(() => null);
+          message.className = 'error';
+          message.textContent = `撤销失败：${formatError(data, response.status)}`;
+          return false;
+        }
+        message.className = 'success';
+        message.textContent = `分享 ${shareId} 已撤销，提交后的访问将返回 410。`;
+        const sessionShare = createdShares.find(item => item.share_id === shareId);
+        if (sessionShare) {
+          sessionShare.revoked = true;
+          renderShares();
+        }
+        return true;
+      } catch (error) {
+        message.className = 'error';
+        message.textContent = `撤销失败：${error.message}`;
+        return false;
+      }
+    }
+
+    document.getElementById('share-status-filter').addEventListener('change', loadManagedShares);
+    document.getElementById('share-refresh-button').addEventListener('click', loadManagedShares);
+    loadManagedShares();
+
+    setInterval(() => {
+      renderShares();
+      loadManagedShares();
+    }, 30000);
   </script>
 </body>
 </html>

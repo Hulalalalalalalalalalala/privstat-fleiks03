@@ -31,8 +31,10 @@ from .database import (
     initialize_database,
     list_datasets,
     list_releases,
+    list_shares,
     query_releases,
     revoke_share,
+    revoke_share_by_id,
 )
 
 
@@ -347,6 +349,40 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         )
         return _share_payload(record)
 
+    @application.get("/api/shares")
+    def list_partner_shares(
+        status: str | None = Query(default=None),
+        dataset_id: str | None = Query(default=None),
+        request_id: str | None = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> list[dict]:
+        if status is not None and status not in ("active", "expired", "revoked"):
+            raise HTTPException(
+                status_code=422,
+                detail="status 只能是 active、expired 或 revoked",
+            )
+        if dataset_id is not None:
+            if not dataset_id.strip() or dataset_id != DATASET_ID:
+                raise HTTPException(
+                    status_code=422, detail=f"未知数据集：{dataset_id}"
+                )
+        if request_id is not None:
+            request_id = request_id.strip()
+            if not request_id:
+                raise HTTPException(
+                    status_code=422, detail="request_id 必须是非空字符串"
+                )
+        # Management-only listing: shares table is the sole source, so no
+        # member data, budget, or release records are touched. Tokens and
+        # their digests are never part of the returned records.
+        return list_shares(
+            path,
+            status=status,
+            dataset_id=dataset_id,
+            request_id=request_id,
+            limit=limit,
+        )
+
     @application.get(
         "/api/shares/{token}/releases", response_model=list[ReleaseRecord]
     )
@@ -370,10 +406,18 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             limit=share["limit"],
         )
 
+    @application.delete("/api/shares/id/{share_id}", status_code=204)
+    def revoke_partner_share_by_id(share_id: str) -> Response:
+        if not revoke_share_by_id(path, share_id):
+            raise HTTPException(status_code=404, detail="未知分享")
+        return Response(status_code=204)
+
     @application.delete("/api/shares/{token}", status_code=204)
     def revoke_partner_share(token: str) -> Response:
-        if not revoke_share(path, token):
-            raise HTTPException(status_code=404, detail="未知分享")
+        # Revocation by token is unconditionally idempotent: an unknown
+        # token yields the same 204 as an existing one, so callers cannot
+        # probe which tokens exist.
+        revoke_share(path, token)
         return Response(status_code=204)
 
     return application
