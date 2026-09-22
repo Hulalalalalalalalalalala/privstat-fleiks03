@@ -1201,3 +1201,144 @@ def list_share_access_events(
         connection.row_factory = sqlite3.Row
         rows = connection.execute(query, tuple(parameters)).fetchall()
     return [_access_event_from_row(row) for row in rows]
+
+
+def summarize_share_usage(
+    path: Path,
+    *,
+    share_id: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Per-share usage rollup over the access window, fully read-only.
+
+    ``shares`` and ``share_access_events`` are read inside one deferred
+    SQLite transaction with ``query_only`` forced on, so the live quota
+    counters and the event aggregates always describe one committed
+    snapshot even while other connections append events, and the
+    connection cannot write by accident. Only those two tables are
+    touched — never member data, budget, release history or token
+    material.
+
+    Without ``share_id`` every share is summarized, including shares with
+    zero events in the window (their window counts are zero and
+    ``last_accessed_at`` is None), ordered by ``created_at`` DESC and
+    capped at ``limit``; with ``share_id`` the result is the single
+    matching summary or an empty list. The window is [start, end)
+    compared against ``accessed_at`` in UTC. Each record carries the
+    share's current ``status`` and lifetime quota fields, the windowed
+    ``event_count`` and summed ``result_count``, one counter per known
+    outcome under ``outcome_counts``, and the nullable
+    ``last_accessed_at`` (the newest windowed event of any outcome).
+    """
+    now_iso = _utc_iso(datetime.now(timezone.utc))
+    with closing(sqlite3.connect(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.isolation_level = None
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("BEGIN")
+        try:
+            share_clauses: list[str] = []
+            share_parameters: list[object] = []
+            if share_id is not None:
+                share_clauses.append("share_id = ?")
+                share_parameters.append(share_id)
+            share_where = (
+                f" WHERE {' AND '.join(share_clauses)}" if share_clauses else ""
+            )
+            share_rows = connection.execute(
+                "SELECT * FROM shares"
+                + share_where
+                + " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (*share_parameters, limit),
+            ).fetchall()
+            aggregates: dict[str, dict] = {}
+            if share_rows:
+                selected_ids = [row["share_id"] for row in share_rows]
+                event_clauses = [
+                    "share_id IN ({})".format(
+                        ", ".join("?" for _ in selected_ids)
+                    )
+                ]
+                event_parameters: list[object] = list(selected_ids)
+                if start is not None:
+                    event_clauses.append("accessed_at >= ?")
+                    event_parameters.append(_utc_iso(start))
+                if end is not None:
+                    event_clauses.append("accessed_at < ?")
+                    event_parameters.append(_utc_iso(end))
+                aggregate_rows = connection.execute(
+                    "SELECT share_id, outcome, COUNT(*) AS events, "
+                    "COALESCE(SUM(result_count), 0) AS results, "
+                    "MAX(accessed_at) AS last_at "
+                    "FROM share_access_events WHERE "
+                    + " AND ".join(event_clauses)
+                    + " GROUP BY share_id, outcome",
+                    tuple(event_parameters),
+                ).fetchall()
+                for row in aggregate_rows:
+                    aggregate = aggregates.setdefault(
+                        row["share_id"],
+                        {
+                            "event_count": 0,
+                            "result_count": 0,
+                            "outcome_counts": {
+                                outcome: 0 for outcome in SHARE_ACCESS_OUTCOMES
+                            },
+                            "last_accessed_at": None,
+                        },
+                    )
+                    aggregate["event_count"] += row["events"]
+                    aggregate["result_count"] += row["results"]
+                    if row["outcome"] in aggregate["outcome_counts"]:
+                        aggregate["outcome_counts"][row["outcome"]] += row["events"]
+                    last_at = row["last_at"]
+                    if (
+                        last_at is not None
+                        and (
+                            aggregate["last_accessed_at"] is None
+                            or last_at > aggregate["last_accessed_at"]
+                        )
+                    ):
+                        aggregate["last_accessed_at"] = last_at
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+    records: list[dict] = []
+    for row in share_rows:
+        aggregate = aggregates.get(
+            row["share_id"],
+            {
+                "event_count": 0,
+                "result_count": 0,
+                "outcome_counts": {
+                    outcome: 0 for outcome in SHARE_ACCESS_OUTCOMES
+                },
+                "last_accessed_at": None,
+            },
+        )
+        max_accesses = row["max_accesses"]
+        records.append(
+            {
+                "share_id": row["share_id"],
+                "dataset_id": row["dataset_id"],
+                "status": _share_status(
+                    row["expires_at"], row["revoked_at"], now_iso
+                ),
+                "max_accesses": max_accesses,
+                "served_count": row["served_count"],
+                "remaining_accesses": (
+                    None
+                    if max_accesses is None
+                    else max(0, max_accesses - row["served_count"])
+                ),
+                "event_count": aggregate["event_count"],
+                "result_count": aggregate["result_count"],
+                "outcome_counts": dict(aggregate["outcome_counts"]),
+                "last_accessed_at": aggregate["last_accessed_at"],
+            }
+        )
+    return records

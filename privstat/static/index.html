@@ -68,6 +68,12 @@
     #audit-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
     #audit-message.error { color: #9b2c2c; }
     #audit-message.success { color: #236345; }
+    #usage-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
+    #usage-message.error { color: #9b2c2c; }
+    #usage-message.success { color: #236345; }
+    .usage-outcomes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+    .usage-outcomes .status-badge { font-weight: 500; }
+    .usage-zero { color: #8a6d1d; font-size: 12px; font-weight: 600; }
     .audit-table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13px; }
     .audit-table th, .audit-table td { text-align: left; padding: 9px 10px; border-bottom: 1px solid #e4eae6; vertical-align: top; word-break: break-all; }
     .audit-table th { color: #547565; font-weight: 600; white-space: nowrap; }
@@ -238,6 +244,23 @@
       </form>
       <div id="audit-message" role="status" aria-live="polite"></div>
       <div id="audit-results"></div>
+    </section>
+
+    <section class="panel" aria-label="分享用量汇总">
+      <div class="eyebrow">SHARE USAGE</div>
+      <h2>合作方分享用量</h2>
+      <p class="intro">在同一个只读快照内汇总各分享的访问配额与窗口内事件：成功访问累计 <code>served_count</code>、窗口内事件数与返回条数合计、五种结果各自计数及最近访问时间。不指定分享时返回全部分享（含窗口内零事件者），按创建时间倒序限量；只读不写，不产生审计事件，也不返回令牌或摘要。</p>
+      <form id="usage-form">
+        <div class="form-grid">
+          <label>分享标识 share_id（可选，精确匹配）<input id="usage-share-id" placeholder="留空表示全部分享"></label>
+          <label>起始时间 from（包含，可选）<input id="usage-from" type="datetime-local" step="1"></label>
+          <label>结束时间 to（不包含，可选）<input id="usage-to" type="datetime-local" step="1"></label>
+          <label>条数 limit（1–100）<input id="usage-limit" type="number" min="1" max="100" value="50"></label>
+        </div>
+        <button type="submit" id="usage-button">查询用量</button>
+      </form>
+      <div id="usage-message" role="status" aria-live="polite"></div>
+      <div id="usage-results"></div>
     </section>
 
     <footer>当前使用合成零售样例，不包含真实客户数据。</footer>
@@ -1115,6 +1138,141 @@
       loadAuditEvents();
     });
     loadAuditEvents();
+
+    const USAGE_FIELDS = [
+      'share_id', 'dataset_id', 'status', 'max_accesses', 'served_count',
+      'remaining_accesses', 'event_count', 'result_count',
+      'outcome_counts', 'last_accessed_at',
+    ];
+    const USAGE_OUTCOME_ORDER = ['served', 'quota_exhausted', 'expired', 'revoked', 'superseded'];
+
+    function describeRemaining(usage) {
+      if (usage.max_accesses === null || usage.max_accesses === undefined) {
+        return `配额 不限次 · 已成功 ${usage.served_count} · 剩余 不限`;
+      }
+      const remaining = usage.remaining_accesses === null || usage.remaining_accesses === undefined
+        ? Math.max(0, usage.max_accesses - usage.served_count)
+        : usage.remaining_accesses;
+      return `配额 ${usage.max_accesses} 次 · 已成功 ${usage.served_count} · 剩余 ${remaining}`;
+    }
+
+    function renderUsageResults(rows) {
+      const container = document.getElementById('usage-results');
+      container.textContent = '';
+      if (!rows.length) {
+        const empty = document.createElement('p');
+        empty.className = 'empty';
+        empty.textContent = '没有匹配的分享用量。';
+        container.append(empty);
+        return;
+      }
+      for (const usage of rows) {
+        const card = document.createElement('article');
+        card.className = 'release-card';
+        const title = document.createElement('h3');
+        const statusMeta = STATUS_LABELS[usage.status] || STATUS_LABELS.active;
+        const badge = document.createElement('span');
+        badge.className = `status-badge ${statusMeta.className}`;
+        badge.textContent = statusMeta.label;
+        const zero = document.createElement('span');
+        zero.className = 'usage-zero';
+        zero.textContent = usage.event_count === 0 ? '窗口内零事件' : '';
+        title.append('分享用量 ', badge, ' ', zero);
+        const details = document.createElement('dl');
+        const items = [
+          ['访问配额', describeRemaining(usage)],
+          ['窗口内事件数', String(usage.event_count)],
+          ['窗口内返回条数合计', String(usage.result_count)],
+          ['最近访问时间', usage.last_accessed_at ? new Date(usage.last_accessed_at).toLocaleString() : '—'],
+          ['数据集', usage.dataset_id],
+          ['share_id', usage.share_id],
+        ];
+        for (const [label, value] of items) {
+          const dt = document.createElement('dt');
+          dt.textContent = label;
+          const dd = document.createElement('dd');
+          dd.textContent = value;
+          details.append(dt, dd);
+        }
+        const outcomeWrap = document.createElement('div');
+        const outcomeDt = document.createElement('dt');
+        outcomeDt.textContent = '窗口内各结果计数';
+        const outcomeDd = document.createElement('dd');
+        const chips = document.createElement('div');
+        chips.className = 'usage-outcomes';
+        for (const outcome of USAGE_OUTCOME_ORDER) {
+          const chip = document.createElement('span');
+          chip.className = `status-badge outcome-${outcome}`;
+          chip.textContent = `${AUDIT_OUTCOME_LABELS[outcome].label.split(' · ')[0]} ${usage.outcome_counts[outcome] ?? 0}`;
+          chips.append(chip);
+        }
+        outcomeDd.append(chips);
+        details.append(outcomeDt, outcomeDd);
+        card.append(title, details);
+        container.append(card);
+      }
+    }
+
+    async function loadUsage() {
+      const message = document.getElementById('usage-message');
+      const params = new URLSearchParams();
+      const shareId = document.getElementById('usage-share-id').value.trim();
+      if (shareId) params.set('share_id', shareId);
+      const fromIso = localInputToIso(document.getElementById('usage-from').value);
+      const toIso = localInputToIso(document.getElementById('usage-to').value);
+      if (fromIso) params.set('from', fromIso);
+      if (toIso) params.set('to', toIso);
+      const limitRaw = document.getElementById('usage-limit').value;
+      const limit = Number.parseInt(limitRaw, 10);
+      if (limitRaw === '' || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+        message.className = 'error';
+        message.textContent = '查询失败：limit 必须是 1–100 的整数。';
+        return;
+      }
+      params.set('limit', String(limit));
+      if (fromIso && toIso && new Date(fromIso) >= new Date(toIso)) {
+        message.className = 'error';
+        message.textContent = '查询失败：起始时间必须早于结束时间。';
+        return;
+      }
+      message.className = '';
+      message.textContent = '';
+      try {
+        const response = await fetch(`/api/share-usage?${params.toString()}`);
+        if (!response.ok) {
+          const data = await response.json().catch(() => null);
+          message.className = 'error';
+          message.textContent = `用量查询失败：${formatError(data, response.status)}`;
+          document.getElementById('usage-results').textContent = '';
+          return;
+        }
+        const rows = await response.json();
+        // Defense in depth: keep only the documented rollup fields; the
+        // usage view has no channel for tokens or digests even if the API
+        // shape changes.
+        const safe = rows.map(row => {
+          const picked = Object.fromEntries(USAGE_FIELDS.map(field => [field, row[field]]));
+          picked.outcome_counts = Object.fromEntries(
+            USAGE_OUTCOME_ORDER.map(outcome => [outcome, row.outcome_counts?.[outcome] ?? 0])
+          );
+          return picked;
+        });
+        renderUsageResults(safe);
+        message.className = safe.length ? 'success' : '';
+        message.textContent = safe.length
+          ? `共返回 ${safe.length} 个分享（按创建时间倒序）。`
+          : '';
+      } catch (error) {
+        message.className = 'error';
+        message.textContent = `用量查询失败：${error.message}`;
+      }
+    }
+
+    document.getElementById('usage-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      loadUsage();
+    });
+    loadUsage();
 
     setInterval(() => {
       renderShares();
