@@ -1006,6 +1006,140 @@ SHARE_ACCESS_OUTCOMES = (
     "quota_exhausted",
 )
 
+# Fields exposed by a usage summary row, in document order. The list doubles
+# as the SELECT projection so neither token_digest nor any other credential
+# column can leak into a summary even if the table grows new columns.
+SHARE_USAGE_FIELDS = (
+    "share_id",
+    "dataset_id",
+    "status",
+    "max_accesses",
+    "served_count",
+    "remaining_accesses",
+    "event_count",
+    "result_count",
+    *SHARE_ACCESS_OUTCOMES,
+    "last_accessed_at",
+)
+
+
+def summarize_share_usage(
+    path: Path,
+    *,
+    share_id: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Per-share usage rollup of the half-open window, in one read-only txn.
+
+    ``shares`` and ``share_access_events`` are read on one connection inside
+    one transaction (``PRAGMA query_only`` forbids writes), so the lifetime
+    counter ``served_count`` and the windowed event aggregates always come
+    from one consistent snapshot under concurrent partner visits. A LEFT
+    JOIN keeps shares with zero events in the window (counts zero,
+    ``last_accessed_at`` None). Rows are newest share first
+    (``created_at DESC, rowid DESC``), capped at ``limit``. The window is
+    [start, end) compared against ``accessed_at`` in canonical UTC ISO form;
+    an unknown ``share_id`` simply matches no share row and returns [].
+
+    Only the two share tables are read — never ``retail_members``, budgets,
+    releases or token generations — and nothing is written. The returned
+    records contain :data:`SHARE_USAGE_FIELDS` alone: no raw token and no
+    token digest.
+    """
+    window_clauses: list[str] = []
+    window_parameters: list[object] = []
+    if start is not None:
+        window_clauses.append("e.accessed_at >= ?")
+        window_parameters.append(_utc_iso(start))
+    if end is not None:
+        window_clauses.append("e.accessed_at < ?")
+        window_parameters.append(_utc_iso(end))
+    window_where = (
+        f" WHERE {' AND '.join(window_clauses)}" if window_clauses else ""
+    )
+    # Conditional aggregation per outcome in one pass; SUM(CASE...) evaluates
+    # to NULL over zero matched events, so COALESCE every counter.
+    outcome_select = ", ".join(
+        f"COALESCE(SUM(CASE WHEN e.outcome = ? THEN 1 ELSE 0 END), 0) AS {outcome}"
+        for outcome in SHARE_ACCESS_OUTCOMES
+    )
+    aggregate_select = (
+        "SELECT e.share_id AS share_id, COUNT(*) AS event_count, "
+        "COALESCE(SUM(e.result_count), 0) AS result_count, "
+        f"{outcome_select}, MAX(e.accessed_at) AS last_accessed_at "
+        f"FROM share_access_events e{window_where} GROUP BY e.share_id"
+    )
+    # The aggregate parameters repeat once per outcome column, followed by
+    # the window bounds; bind them all positionally below.
+    aggregate_parameters = [*SHARE_ACCESS_OUTCOMES, *window_parameters]
+    share_clauses: list[str] = []
+    share_parameters: list[object] = []
+    if share_id is not None:
+        share_clauses.append("s.share_id = ?")
+        share_parameters.append(share_id)
+    now_iso = _utc_iso(datetime.now(timezone.utc))
+    query = (
+        "SELECT s.share_id AS share_id, s.dataset_id AS dataset_id, "
+        "CASE WHEN s.revoked_at IS NOT NULL THEN 'revoked' "
+        "WHEN s.expires_at <= ? THEN 'expired' ELSE 'active' END AS status, "
+        "s.max_accesses AS max_accesses, s.served_count AS served_count, "
+        "COALESCE(a.event_count, 0) AS event_count, "
+        "COALESCE(a.result_count, 0) AS result_count, "
+        + ", ".join(
+            f"COALESCE(a.{outcome}, 0) AS {outcome}"
+            for outcome in SHARE_ACCESS_OUTCOMES
+        )
+        + ", a.last_accessed_at AS last_accessed_at "
+        "FROM shares s LEFT JOIN (" + aggregate_select + ") a "
+        "ON a.share_id = s.share_id"
+        + (f" WHERE {' AND '.join(share_clauses)}" if share_clauses else "")
+        + " ORDER BY s.created_at DESC, s.rowid DESC LIMIT ?"
+    )
+    with closing(sqlite3.connect(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        # Read-only by construction: one transaction boundary for both reads
+        # and a pragma that rejects any accidental write, so this summary can
+        # neither add events nor change share, quota, budget or release state.
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("BEGIN")
+        try:
+            # Placeholders bind in textual order: the status "now", then the
+            # aggregate subquery (outcome names, window bounds), then the
+            # outer share filter and LIMIT.
+            rows = connection.execute(
+                query,
+                (now_iso, *aggregate_parameters, *share_parameters, limit),
+            ).fetchall()
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+    records: list[dict] = []
+    for row in rows:
+        record = {
+            "share_id": row["share_id"],
+            "dataset_id": row["dataset_id"],
+            "status": row["status"],
+            "max_accesses": row["max_accesses"],
+            "served_count": row["served_count"],
+            "remaining_accesses": (
+                None
+                if row["max_accesses"] is None
+                else max(0, row["max_accesses"] - row["served_count"])
+            ),
+            "event_count": row["event_count"],
+            "result_count": row["result_count"],
+            "last_accessed_at": row["last_accessed_at"],
+        }
+        for outcome in SHARE_ACCESS_OUTCOMES:
+            record[outcome] = row[outcome]
+        # Emit keys in the documented order.
+        records.append({field: record[field] for field in SHARE_USAGE_FIELDS})
+    return records
+
 
 def _access_event_from_row(row: sqlite3.Row) -> dict:
     return {

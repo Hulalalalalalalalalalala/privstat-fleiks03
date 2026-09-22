@@ -49,6 +49,7 @@ from .database import (
     revoke_share,
     revoke_share_by_id,
     rotate_share,
+    summarize_share_usage,
 )
 
 
@@ -167,6 +168,27 @@ class ShareAccessEventRecord(BaseModel):
     outcome: str
     result_count: int
     accessed_at: str
+
+
+class ShareUsageRecord(BaseModel):
+    # Partner-facing usage rollup: identity and current state, the lifetime
+    # quota counters, windowed event/result totals split across the five
+    # existing outcomes, and the latest event time. No credential fields and
+    # no member data ever appear here.
+    share_id: str
+    dataset_id: str
+    status: str
+    max_accesses: int | None
+    served_count: int
+    remaining_accesses: int | None
+    event_count: int
+    result_count: int
+    served: int
+    expired: int
+    revoked: int
+    superseded: int
+    quota_exhausted: int
+    last_accessed_at: str | None
 
 
 def _parse_share_time(raw: object, name: str) -> datetime:
@@ -670,6 +692,40 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             path,
             share_id=share_id,
             outcome=outcome,
+            start=start,
+            end=end,
+            limit=limit,
+        )
+
+    @application.get(
+        "/api/share-usage", response_model=list[ShareUsageRecord]
+    )
+    def share_usage(
+        share_id: str | None = Query(default=None),
+        from_time: str | None = Query(default=None, alias="from"),
+        to_time: str | None = Query(default=None, alias="to"),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> list[dict]:
+        # Same validation contract as the audit endpoint: a blank share_id,
+        # a non-timezone timestamp, a non-half-open window or an out-of-range
+        # limit is a 422; an unknown share_id is a valid filter matching
+        # nothing and answers 200 with an empty array.
+        if share_id is not None:
+            share_id = share_id.strip()
+            if not share_id:
+                raise HTTPException(
+                    status_code=422, detail="share_id 必须是非空字符串"
+                )
+        start = _parse_access_event_time(from_time, "from") if from_time is not None else None
+        end = _parse_access_event_time(to_time, "to") if to_time is not None else None
+        if start is not None and end is not None and start >= end:
+            raise HTTPException(status_code=422, detail="from 必须早于 to")
+        # Read-only summary of the two share tables in one transaction: no
+        # event is recorded by this call, and share, quota, budget and
+        # release state are all untouched.
+        return summarize_share_usage(
+            path,
+            share_id=share_id,
             start=start,
             end=end,
             limit=limit,

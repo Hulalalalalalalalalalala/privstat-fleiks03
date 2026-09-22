@@ -66,12 +66,14 @@
     .outcome-superseded { color: #4a5a6a; background: #edf0f4; }
     .outcome-quota_exhausted { color: #7a3a8c; background: #f4ecf9; }
     #audit-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
-    #audit-message.error { color: #9b2c2c; }
-    #audit-message.success { color: #236345; }
+    #audit-message.error, #usage-message.error { color: #9b2c2c; }
+    #audit-message.success, #usage-message.success { color: #236345; }
     .audit-table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13px; }
     .audit-table th, .audit-table td { text-align: left; padding: 9px 10px; border-bottom: 1px solid #e4eae6; vertical-align: top; word-break: break-all; }
     .audit-table th { color: #547565; font-weight: 600; white-space: nowrap; }
     .empty { color: #76847b; font-size: 14px; }
+    #usage-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
+    tr.usage-zero td { color: #76847b; }
     #batch-message { margin-top: 16px; font-size: 14px; line-height: 1.6; }
     #batch-message.error { color: #9b2c2c; }
     #batch-message.success { color: #236345; }
@@ -238,6 +240,23 @@
       </form>
       <div id="audit-message" role="status" aria-live="polite"></div>
       <div id="audit-results"></div>
+    </section>
+
+    <section class="panel" aria-label="合作方用量汇总">
+      <div class="eyebrow">SHARE USAGE</div>
+      <h2>合作方分享用量汇总</h2>
+      <p class="intro">在同一只读快照内汇总每个分享的访问用量：窗口内事件总数、返回条数合计（各 served 事件返回条数之和）、五种结果各自计数与最近访问时间，并展示当前状态、总配额、已用与剩余次数。未指定分享时列出全部分享，包括窗口内零事件的分享，按分享创建时间倒序。汇总为只读操作，不产生访问事件，也不改变分享、配额、预算或发布历史；页面不显示令牌或摘要。</p>
+      <form id="usage-form">
+        <div class="form-grid">
+          <label>分享标识 share_id（可选，精确匹配）<input id="usage-share-id" placeholder="留空表示全部分享"></label>
+          <label>起始时间 from（包含，可选）<input id="usage-from" type="datetime-local" step="1"></label>
+          <label>结束时间 to（不包含，可选）<input id="usage-to" type="datetime-local" step="1"></label>
+          <label>条数 limit（1–100）<input id="usage-limit" type="number" min="1" max="100" value="50"></label>
+        </div>
+        <button type="submit" id="usage-button">查询用量汇总</button>
+      </form>
+      <div id="usage-message" role="status" aria-live="polite"></div>
+      <div id="usage-results"></div>
     </section>
 
     <footer>当前使用合成零售样例，不包含真实客户数据。</footer>
@@ -1116,9 +1135,152 @@
     });
     loadAuditEvents();
 
+    const USAGE_FIELDS = ['share_id', 'dataset_id', 'status', 'max_accesses', 'served_count',
+      'remaining_accesses', 'event_count', 'result_count',
+      'served', 'expired', 'revoked', 'superseded', 'quota_exhausted', 'last_accessed_at'];
+
+    function describeRemaining(row) {
+      if (row.max_accesses === null || row.max_accesses === undefined) {
+        return `上限 不限 · 已用 ${row.served_count ?? 0} · 剩余 不限`;
+      }
+      const remaining = row.remaining_accesses === null || row.remaining_accesses === undefined
+        ? Math.max(0, row.max_accesses - (row.served_count ?? 0))
+        : row.remaining_accesses;
+      return `上限 ${row.max_accesses} · 已用 ${row.served_count ?? 0} · 剩余 ${remaining}`;
+    }
+
+    function renderShareUsage(rows) {
+      const container = document.getElementById('usage-results');
+      container.textContent = '';
+      if (!rows.length) {
+        const empty = document.createElement('p');
+        empty.className = 'empty';
+        empty.textContent = '没有符合条件的分享。';
+        container.append(empty);
+        return;
+      }
+      const zeroCount = rows.filter(row => !row.event_count).length;
+      const table = document.createElement('table');
+      table.className = 'audit-table';
+      const thead = document.createElement('thead');
+      const headRow = document.createElement('tr');
+      for (const label of ['状态', 'share_id', '配额（已用/剩余）', '窗口事件', '返回条数合计',
+          'served', '配额用尽', 'expired', 'revoked', 'superseded', '最近访问时间']) {
+        const th = document.createElement('th');
+        th.textContent = label;
+        headRow.append(th);
+      }
+      thead.append(headRow);
+      const tbody = document.createElement('tbody');
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        if (!row.event_count) tr.className = 'usage-zero';
+        const statusTd = document.createElement('td');
+        const statusMeta = STATUS_LABELS[row.status] || STATUS_LABELS.active;
+        const badge = document.createElement('span');
+        badge.className = `status-badge ${statusMeta.className}`;
+        badge.textContent = statusMeta.label;
+        statusTd.append(badge);
+        const idTd = document.createElement('td');
+        idTd.textContent = row.share_id;
+        const quotaTd = document.createElement('td');
+        quotaTd.textContent = describeRemaining(row);
+        const eventsTd = document.createElement('td');
+        eventsTd.textContent = row.event_count
+          ? String(row.event_count)
+          : '0（窗口内零事件）';
+        const resultTd = document.createElement('td');
+        resultTd.textContent = String(row.result_count);
+        const servedTd = document.createElement('td');
+        servedTd.textContent = String(row.served);
+        const exhaustedTd = document.createElement('td');
+        exhaustedTd.textContent = String(row.quota_exhausted);
+        const expiredTd = document.createElement('td');
+        expiredTd.textContent = String(row.expired);
+        const revokedTd = document.createElement('td');
+        revokedTd.textContent = String(row.revoked);
+        const supersededTd = document.createElement('td');
+        supersededTd.textContent = String(row.superseded);
+        const lastTd = document.createElement('td');
+        lastTd.textContent = row.last_accessed_at
+          ? new Date(row.last_accessed_at).toLocaleString()
+          : '—';
+        tr.append(statusTd, idTd, quotaTd, eventsTd, resultTd, servedTd,
+          exhaustedTd, expiredTd, revokedTd, supersededTd, lastTd);
+        tbody.append(tr);
+      }
+      table.append(thead, tbody);
+      container.append(table);
+      if (zeroCount) {
+        const note = document.createElement('p');
+        note.className = 'empty';
+        note.style.marginTop = '10px';
+        note.textContent = `其中 ${zeroCount} 个分享在所选窗口内没有访问事件（计数为 0、最近访问时间为空），仍按创建时间倒序列出。`;
+        container.append(note);
+      }
+    }
+
+    async function loadShareUsage() {
+      const message = document.getElementById('usage-message');
+      const params = new URLSearchParams();
+      const shareId = document.getElementById('usage-share-id').value.trim();
+      if (shareId) params.set('share_id', shareId);
+      const fromIso = localInputToIso(document.getElementById('usage-from').value);
+      const toIso = localInputToIso(document.getElementById('usage-to').value);
+      if (fromIso) params.set('from', fromIso);
+      if (toIso) params.set('to', toIso);
+      const limitRaw = document.getElementById('usage-limit').value;
+      const limit = Number.parseInt(limitRaw, 10);
+      if (limitRaw === '' || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+        message.className = 'error';
+        message.textContent = '查询失败：limit 必须是 1–100 的整数。';
+        return;
+      }
+      params.set('limit', String(limit));
+      if (fromIso && toIso && new Date(fromIso) >= new Date(toIso)) {
+        message.className = 'error';
+        message.textContent = '查询失败：起始时间必须早于结束时间。';
+        return;
+      }
+      message.className = '';
+      message.textContent = '';
+      try {
+        const response = await fetch(`/api/share-usage?${params.toString()}`);
+        if (!response.ok) {
+          const data = await response.json().catch(() => null);
+          message.className = 'error';
+          message.textContent = `用量查询失败：${formatError(data, response.status)}`;
+          document.getElementById('usage-results').textContent = '';
+          return;
+        }
+        const rows = await response.json();
+        // Defense in depth: keep only the documented summary fields; the
+        // usage view has no channel for tokens or digests even if the API
+        // shape changes.
+        const safe = rows.map(row => Object.fromEntries(
+          USAGE_FIELDS.map(field => [field, row[field]])
+        ));
+        renderShareUsage(safe);
+        message.className = '';
+        message.textContent = rows.length
+          ? `共返回 ${rows.length} 个分享（按创建时间倒序）。`
+          : '没有符合条件的分享。';
+      } catch (error) {
+        message.className = 'error';
+        message.textContent = `用量查询失败：${error.message}`;
+      }
+    }
+
+    document.getElementById('usage-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      loadShareUsage();
+    });
+    loadShareUsage();
+
     setInterval(() => {
       renderShares();
       loadManagedShares();
+      loadShareUsage();
     }, 30000);
   </script>
 </body>
